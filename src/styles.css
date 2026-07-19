@@ -1,0 +1,922 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+:root {
+  font-family: "Segoe UI", "Yu Gothic UI", system-ui, sans-serif;
+  color: #eee;
+  user-select: none;
+  /* アクセントカラー（HSB 114:31:95）。緑系のため、旧・青(#2a6cf0)と違って
+     知覚的に明るく見える＝上に載せる文字は白ではなく濃色にする必要がある。 */
+  --accent: #aff2a7;
+  --accent-rgb: 175, 242, 167;
+  --accent-hover: #d1ffcc;
+  --accent-dark: #295a24;
+  --accent-text: #112e0e;
+}
+
+html,
+body,
+#viewer {
+  width: 100%;
+  height: 100vh;
+  overflow: hidden;
+  background: #767676; /* 18%グレー（写真の基準グレー） */
+}
+
+#viewer {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* 背景の透かしロゴ：#viewerの背景色の上・他の表示要素の下に来るよう負のz-indexで配置。
+   #page等は無指定(auto)のため、ここは常にそれらの下に描画される。 */
+#bg-watermark {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: min(38vh, 38vw);
+  opacity: 0.08;
+  z-index: -1;
+  pointer-events: none;
+  -webkit-user-drag: none;
+}
+
+/* 表示中の画像：サイズはJS側でフィットモード・回転に応じて計算し px 指定する。
+   object-fit:contain は、万一サイズ計算が実際の画像と一瞬ずれた場合でも、
+   歪んで伸びるのではなく比率を保ったまま収まるようにする保険。 */
+#page {
+  display: none;
+  object-fit: contain;
+  -webkit-user-drag: none;
+}
+#page.loaded {
+  display: block;
+}
+
+/* 見開き表示：2枚を隙間なく並べる。サイズはJS側でapplyLayoutSpread()が計算する */
+#spread {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+#spread.hidden {
+  display: none;
+}
+#spread img {
+  display: block;
+  object-fit: contain;
+  -webkit-user-drag: none;
+}
+
+/* サムネイル準備の進捗（画面上部に固定表示） */
+#progress {
+  position: absolute;
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 14px;
+  background: rgba(0, 0, 0, 0.6);
+  border-radius: 999px;
+  font-size: 0.8rem;
+  color: #ddd;
+  z-index: 30;
+  white-space: nowrap;
+}
+#progress.hidden {
+  display: none;
+}
+.progress-track {
+  width: 140px;
+  height: 6px;
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 999px;
+  overflow: hidden;
+}
+#progress-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+  transition: width 0.15s;
+}
+
+/* 初期案内 */
+#hint {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  text-align: center;
+}
+#hint .title {
+  font-size: 2.2rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: #fff;
+}
+#hint .sub {
+  font-size: 0.85rem;
+  color: #fff;
+}
+#hint button {
+  padding: 10px 24px;
+  font-size: 1rem;
+  font-family: inherit;
+  color: var(--accent-text);
+  background: var(--accent);
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+#hint button:hover {
+  background: var(--accent-hover);
+}
+
+/* ナビゲーター：ズーム中／画像が画面より大きい時に自動表示するミニマップ。
+   倍率リセットボタンとまとめて、右下基準の位置固定コンテナに入れる
+   （ナビゲーター自体のサイズがサムネイルの縦横比で変わっても位置がずれないように）。 */
+#navigator-panel {
+  position: absolute;
+  right: 14px;
+  bottom: 62px;
+  z-index: 15;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+}
+#navigator-panel.hidden {
+  display: none;
+}
+.nav-panel-row {
+  display: flex;
+  gap: 6px;
+}
+/* 「ナビを隠す」押下中：ボタン自身だけ薄く残し、他は消して背面の画像を見せる */
+#navigator-panel.peek #navigator,
+#navigator-panel.peek #zoom-reset-btn,
+#navigator-panel.peek #nav-fit-btn {
+  opacity: 0;
+}
+#navigator-panel.peek #nav-hide-btn {
+  opacity: 0.35;
+}
+#zoom-reset-btn,
+#nav-hide-btn,
+#nav-fit-btn {
+  padding: 4px 10px;
+  font-size: 0.8rem;
+  background: rgba(0, 0, 0, 0.7);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 6px;
+  color: #eee;
+  cursor: pointer;
+}
+#zoom-reset-btn:hover,
+#nav-hide-btn:hover,
+#nav-fit-btn:hover {
+  background: rgba(var(--accent-rgb), 0.5);
+}
+#navigator.hidden {
+  display: none;
+}
+#navigator {
+  /* #nav-viewport（表示範囲の矩形）の position:absolute の基準にする。
+     これが無いとリセットボタンを含む外側パネル基準になり、ボタンの高さ分ズレる。 */
+  position: relative;
+  max-width: 270px;
+  max-height: 270px;
+  background: rgba(0, 0, 0, 0.7);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 8px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5);
+  overflow: hidden;
+  cursor: pointer;
+}
+#nav-thumb {
+  display: block;
+  width: 100%;
+  height: 100%;
+  -webkit-user-drag: none;
+}
+#nav-viewport {
+  position: absolute;
+  border: 2px solid var(--accent);
+  background: rgba(var(--accent-rgb), 0.18);
+  pointer-events: none;
+}
+
+/* 下部コントロールバー：横一列 */
+#bar {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 48px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 14px;
+  background: linear-gradient(to top, rgba(0, 0, 0, 0.85), rgba(0, 0, 0, 0.4));
+  opacity: 0;
+  transform: translateY(6px);
+  transition: opacity 0.18s, transform 0.18s;
+  pointer-events: none;
+}
+#bar.show {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: auto;
+}
+
+#bar .nav {
+  display: flex;
+  flex-shrink: 0; /* ウィンドウが狭くてもボタン群は縮めず、シークバー側を縮める */
+  gap: 4px;
+}
+#bar .nav button {
+  flex-shrink: 0;
+  width: 34px;
+  height: 30px;
+  font-size: 0.95rem;
+  color: #eee;
+  background: rgba(255, 255, 255, 0.08);
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.12s;
+}
+#bar .nav button:hover {
+  background: rgba(255, 255, 255, 0.22);
+}
+#bind-arrow {
+  font-size: 0.65rem;
+  vertical-align: super;
+}
+
+#seek {
+  flex: 1;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+#seek:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+#counter {
+  min-width: 76px;
+  text-align: right;
+  font-size: 0.9rem;
+  color: #ddd;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ポップアップメニュー共通（全体メニュー・表示設定メニューで共有） */
+.dropdown-menu {
+  position: absolute;
+  bottom: 56px;
+  min-width: 180px;
+  max-height: calc(100vh - 90px);
+  overflow-y: auto;
+  padding: 6px;
+  background: #262626;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  z-index: 10;
+}
+.dropdown-menu.hidden {
+  display: none;
+}
+.dropdown-menu button {
+  padding: 9px 12px;
+  font-size: 0.9rem;
+  font-family: inherit;
+  text-align: left;
+  color: #eee;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.dropdown-menu button:hover {
+  background: var(--accent);
+  color: var(--accent-text);
+}
+.dropdown-menu button.active {
+  background: var(--accent-dark);
+}
+.dropdown-menu .menu-sep {
+  height: 1px;
+  margin: 4px 2px;
+  background: rgba(255, 255, 255, 0.1);
+}
+.dropdown-menu .menu-label {
+  padding: 4px 12px 0;
+  font-size: 0.75rem;
+  color: #888;
+}
+.dropdown-menu .menu-radio {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  font-size: 0.85rem;
+  color: #eee;
+  cursor: pointer;
+}
+.dropdown-menu .menu-radio input {
+  accent-color: var(--accent);
+}
+/* #menu / #display-menu の位置はJS側で開くたびにボタン位置基準で計算する */
+#resize-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 2px 12px 4px 28px;
+}
+#resize-detail.hidden {
+  display: none;
+}
+.menu-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 0.8rem;
+  color: #ccc;
+  padding: 3px 0;
+}
+.menu-row select,
+.menu-row input[type="range"] {
+  accent-color: var(--accent);
+}
+.menu-note {
+  padding: 4px 12px 8px;
+  font-size: 0.72rem;
+  line-height: 1.5;
+  color: #888;
+}
+#cache-custom-mb {
+  color: #eee;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 4px;
+  padding: 1px 4px;
+}
+.cache-usage {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 12px 10px;
+  font-size: 0.72rem;
+  color: #999;
+}
+.cache-usage-track {
+  flex: 1;
+  height: 6px;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 999px;
+  overflow: hidden;
+}
+#cache-usage-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+  transition: width 0.15s;
+}
+
+/* サムネイル一覧（グリッド） */
+/* このアプリについてパネル（説明書と同じ全画面オーバーレイ構成） */
+#about {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  background: #0d0d0d;
+}
+#about.hidden {
+  display: none;
+}
+#about-close {
+  margin-left: auto;
+  width: 32px;
+  height: 32px;
+  font-size: 1rem;
+  background: rgba(255, 255, 255, 0.08);
+  border: none;
+  border-radius: 6px;
+  color: #eee;
+  cursor: pointer;
+}
+#about-close:hover {
+  background: rgba(255, 255, 255, 0.18);
+}
+#about-scroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px 28px 40px;
+  max-width: 620px;
+  width: 100%;
+  margin: 0 auto;
+  line-height: 1.8;
+}
+#about-scroll h2 {
+  font-size: 0.95rem;
+  margin: 22px 0 6px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.14);
+  color: var(--accent);
+}
+#about-scroll ul {
+  margin: 4px 0;
+  padding-left: 1.4em;
+}
+#about-scroll li {
+  margin: 3px 0;
+}
+#about-scroll a {
+  color: var(--accent);
+}
+
+/* 説明書パネル（サムネイル一覧と同じ全画面オーバーレイ構成） */
+#help {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  background: #0d0d0d;
+}
+#help.hidden {
+  display: none;
+}
+#help-close {
+  margin-left: auto;
+  width: 32px;
+  height: 32px;
+  font-size: 1rem;
+  background: rgba(255, 255, 255, 0.08);
+  border: none;
+  border-radius: 6px;
+  color: #eee;
+  cursor: pointer;
+}
+#help-close:hover {
+  background: rgba(255, 255, 255, 0.18);
+}
+#help-scroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: 18px 24px 28px;
+  max-width: 980px;
+  width: 100%;
+  margin: 0 auto;
+}
+/* 一瞥で全体が見えるよう、2カラムのコンパクトな表組みにする */
+.help-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px 28px;
+  align-items: start;
+}
+@media (max-width: 720px) {
+  .help-grid {
+    grid-template-columns: 1fr;
+  }
+}
+#help-scroll h2 {
+  font-size: 0.85rem;
+  margin: 8px 0 4px;
+  color: var(--accent);
+}
+#help-scroll table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.85rem;
+}
+#help-scroll td {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 3px 10px 3px 0;
+  vertical-align: top;
+}
+#help-scroll td:first-child {
+  white-space: nowrap;
+  color: #ddd;
+  font-weight: 600;
+  width: 1%;
+  padding-right: 16px;
+}
+#help-scroll td:last-child {
+  color: #aaa;
+}
+
+/* キー割り当てパネル（説明書と同じ全画面オーバーレイ構成） */
+#keybind {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  background: #0d0d0d;
+}
+#keybind.hidden {
+  display: none;
+}
+#keybind-reset,
+#keybind-close {
+  background: rgba(255, 255, 255, 0.08);
+  border: none;
+  border-radius: 6px;
+  color: #eee;
+  cursor: pointer;
+}
+#keybind-reset {
+  margin-left: auto;
+  padding: 6px 12px;
+  font-size: 0.85rem;
+}
+#keybind-close {
+  width: 32px;
+  height: 32px;
+  font-size: 1rem;
+}
+#keybind-reset:hover,
+#keybind-close:hover {
+  background: rgba(255, 255, 255, 0.18);
+}
+#keybind-scroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: 18px 24px 28px;
+  max-width: 520px;
+  width: 100%;
+  margin: 0 auto;
+}
+.keybind-note {
+  font-size: 0.82rem;
+  color: #999;
+  margin-bottom: 14px;
+  line-height: 1.6;
+}
+#keybind-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+#keybind-table td {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 8px 6px;
+  vertical-align: middle;
+}
+#keybind-table td:first-child {
+  color: #ddd;
+}
+.keybind-key {
+  display: inline-block;
+  min-width: 64px;
+  padding: 3px 10px;
+  text-align: center;
+  background: rgba(255, 255, 255, 0.1);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 6px;
+  font-family: inherit;
+  color: var(--accent);
+}
+.keybind-key.unset {
+  color: #888;
+  font-style: italic;
+}
+.keybind-change-btn {
+  margin-left: 10px;
+  padding: 3px 10px;
+  font-size: 0.82rem;
+  background: rgba(255, 255, 255, 0.08);
+  border: none;
+  border-radius: 6px;
+  color: #eee;
+  cursor: pointer;
+}
+.keybind-change-btn:hover {
+  background: rgba(var(--accent-rgb), 0.5);
+}
+.keybind-change-btn.waiting {
+  background: rgba(var(--accent-rgb), 0.7);
+  color: var(--accent-text);
+}
+
+#grid {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  background: #0d0d0d;
+}
+#grid.hidden {
+  display: none;
+}
+.grid-toolbar {
+  height: 48px;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  padding: 0 16px;
+  background: #1a1a1a;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+.grid-title {
+  font-weight: 600;
+}
+.grid-size {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.85rem;
+  color: #bbb;
+}
+.grid-size input {
+  accent-color: var(--accent);
+  width: 160px;
+}
+#grid-close {
+  margin-left: auto;
+  width: 32px;
+  height: 30px;
+  color: #eee;
+  background: rgba(255, 255, 255, 0.08);
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+#grid-close:hover {
+  background: rgba(255, 255, 255, 0.22);
+}
+
+/* 下限サイズ未満には縮まず、あふれた分は縦スクロール */
+#grid-scroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: 14px;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(var(--thumb, 160px), 1fr));
+  gap: 12px;
+  align-content: start;
+}
+.cell {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 6px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.03);
+  cursor: pointer;
+  transition: background 0.12s;
+}
+.cell:hover {
+  background: rgba(255, 255, 255, 0.12);
+}
+.cell.current {
+  outline: 2px solid var(--accent);
+}
+.cell.loading {
+  min-height: calc(var(--thumb, 160px) * 1.2);
+}
+.cell img {
+  width: 100%;
+  height: auto;
+  max-height: calc(var(--thumb, 160px) * 1.5);
+  object-fit: contain;
+  background: #000;
+  border-radius: 4px;
+  display: block;
+}
+.cell .no {
+  font-size: 0.75rem;
+  color: #aaa;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 起動時の自動再開確認ダイアログ */
+#resume-dialog {
+  position: absolute;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.55);
+}
+#resume-dialog.hidden {
+  display: none;
+}
+.resume-box {
+  max-width: 420px;
+  padding: 24px 28px;
+  background: #222;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 12px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6);
+  text-align: center;
+  line-height: 1.6;
+}
+.resume-text p {
+  margin-bottom: 4px;
+}
+.resume-text p:last-child {
+  margin-bottom: 0;
+}
+.resume-title {
+  font-weight: 600;
+  font-size: 1.05rem;
+}
+.resume-actions {
+  margin-top: 18px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+.resume-actions-main {
+  display: flex;
+  gap: 10px;
+  justify-content: center;
+}
+.resume-actions button {
+  padding: 9px 18px;
+  font-size: 0.9rem;
+  font-family: inherit;
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+}
+#resume-continue {
+  background: var(--accent);
+  color: var(--accent-text);
+}
+#resume-continue:hover {
+  background: var(--accent-hover);
+}
+#resume-restart,
+#resume-open-new,
+#resume-cancel {
+  background: rgba(255, 255, 255, 0.12);
+}
+#resume-restart:hover,
+#resume-open-new:hover,
+#resume-cancel:hover {
+  background: rgba(255, 255, 255, 0.22);
+}
+
+/* しおり一覧（サムネイル一覧のグリッド見た目を流用） */
+#bookmarks {
+  position: absolute;
+  inset: 0;
+  z-index: 25;
+  display: flex;
+  flex-direction: column;
+  background: #0d0d0d;
+}
+#bookmarks.hidden {
+  display: none;
+}
+.bm-scope {
+  display: flex;
+  gap: 4px;
+}
+.bm-scope button {
+  padding: 6px 12px;
+  font-size: 0.82rem;
+  font-family: inherit;
+  color: #ccc;
+  background: rgba(255, 255, 255, 0.06);
+  border: none;
+  border-radius: 999px;
+  cursor: pointer;
+}
+.bm-scope button.active {
+  background: var(--accent);
+  color: var(--accent-text);
+}
+#bm-clear-broken {
+  padding: 6px 12px;
+  font-size: 0.82rem;
+  font-family: inherit;
+  color: #fff;
+  background: #b02a2a;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+#bm-clear-broken.hidden {
+  display: none;
+}
+#bookmarks-close {
+  margin-left: auto;
+  width: 32px;
+  height: 30px;
+  color: #eee;
+  background: rgba(255, 255, 255, 0.08);
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+#bookmarks-close:hover {
+  background: rgba(255, 255, 255, 0.22);
+}
+
+#bookmarks-scroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: 14px;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 12px;
+  align-content: start;
+}
+.bm-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.03);
+}
+.bm-cell img {
+  width: 100%;
+  max-height: 220px;
+  object-fit: contain;
+  background: #000;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.bm-cell .bm-info {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.78rem;
+  color: #bbb;
+}
+.bm-cell .bm-info .bm-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.bm-cell.broken {
+  outline: 1px solid rgba(220, 80, 80, 0.5);
+}
+.bm-cell .bm-warn {
+  font-size: 0.75rem;
+  color: #ff9a9a;
+}
+/* 削除優先UI：見つからない項目は「削除」を大きく押しやすく、
+   「再リンク」は控えめな ⋯ メニューに格納する。 */
+.bm-cell .bm-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.bm-delete {
+  flex: 1;
+  padding: 6px 0;
+  font-size: 0.8rem;
+  font-family: inherit;
+  color: #fff;
+  background: #b02a2a;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.bm-delete:hover {
+  background: #d13a3a;
+}
+.bm-more {
+  width: 26px;
+  height: 26px;
+  color: #ccc;
+  background: rgba(255, 255, 255, 0.08);
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}

@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MameViewer</title>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+
+  <body>
+    <div id="viewer">
+      <!-- 背景の透かしロゴ。#viewer自身の背景色より上・他の表示より下に負のz-indexで配置 -->
+      <img id="bg-watermark" src="/watermark.png" alt="" draggable="false" />
+      <img id="page" alt="" draggable="false" />
+
+      <!-- 見開き表示（Dキーで単ページと切替） -->
+      <div id="spread" class="hidden">
+        <img id="page-left" alt="" draggable="false" />
+        <img id="page-right" alt="" draggable="false" />
+      </div>
+
+      <div id="hint">
+        <p class="title">MameViewer</p>
+        <p>Zip / Rar / 7z、画像ファイル、フォルダを開いてください</p>
+        <button id="open-btn">ファイルを開く</button>
+        <p class="sub">ウィンドウにドラッグ＆ドロップでも開けます</p>
+      </div>
+
+      <!-- サムネイル一覧（A キー / ▦ ボタン で開閉） -->
+      <div id="grid" class="hidden">
+        <div class="grid-toolbar">
+          <span class="grid-title">サムネイル一覧</span>
+          <label class="grid-size">
+            サイズ
+            <input id="thumb-size" type="range" min="100" max="320" value="160" />
+          </label>
+          <button id="grid-close" title="閉じる (A / Esc)">✕</button>
+        </div>
+        <div id="grid-scroll"></div>
+      </div>
+
+      <!-- しおり一覧（Ctrl+B / ≡メニュー で開閉） -->
+      <div id="bookmarks" class="hidden">
+        <div class="grid-toolbar">
+          <span class="grid-title">しおり一覧</span>
+          <div class="bm-scope">
+            <button id="bm-scope-file" class="active" data-scope="file">このファイル</button>
+            <button id="bm-scope-all" data-scope="all">すべて</button>
+          </div>
+          <button id="bm-clear-broken" class="hidden">見つからない項目をまとめて削除</button>
+          <button id="bookmarks-close" title="閉じる (Ctrl+B / Esc)">✕</button>
+        </div>
+        <div id="bookmarks-scroll"></div>
+      </div>
+
+      <!-- 説明書（≡メニュー「使い方」/ H キーで開閉） -->
+      <div id="help" class="hidden">
+        <div class="grid-toolbar">
+          <span class="grid-title">MameViewer の使い方</span>
+          <button id="help-close" title="閉じる (H / Esc)">✕</button>
+        </div>
+        <div id="help-scroll">
+          <div class="help-grid">
+            <section>
+              <h2>マウス</h2>
+              <table>
+                <tr><td>ホイール ↓ / ↑</td><td>次 / 前（見開き単位）</td></tr>
+                <tr><td>左クリック / 右クリック</td><td>次 / 前</td></tr>
+                <tr><td>サイド 戻る / 進む</td><td>1ページだけ前 / 次（ズレ補正）</td></tr>
+                <tr><td>戻る＋ホイール</td><td>ズーム（カーソル基準）</td></tr>
+                <tr><td>進む＋ホイール</td><td>前後の巻へ移動</td></tr>
+                <tr><td>Ctrl＋ホイール</td><td>ズーム</td></tr>
+                <tr><td>左ドラッグ</td><td>画像の移動（画面より大きい時）</td></tr>
+              </table>
+            </section>
+            <section>
+              <h2>キーボード（⚙メニュー「キー割り当てを変更」で変更可）</h2>
+              <table id="help-kb-table">
+                <tbody id="help-kb-rows"></tbody>
+              </table>
+            </section>
+            <section>
+              <h2>画面のボタン</h2>
+              <table>
+                <tr><td>◀◀ / ▶▶</td><td>前 / 次の巻</td></tr>
+                <tr><td>◀ / ▶</td><td>1ページ前 / 次</td></tr>
+                <tr><td>📖</td><td>綴じ方向切替（矢印＝読む方向）</td></tr>
+                <tr><td>🖼</td><td>見開き・回転・フィット</td></tr>
+                <tr><td>▦</td><td>サムネイル一覧</td></tr>
+                <tr><td>≡</td><td>メニュー（開く・しおり・巻末動作）</td></tr>
+                <tr><td>⚙</td><td>設定（使い方・キー割り当て・メモリ）</td></tr>
+                <tr><td>ナビゲーター</td><td>拡大中の位置表示。クリックで移動</td></tr>
+              </table>
+            </section>
+            <section>
+              <h2>ヒント</h2>
+              <table>
+                <tr><td>開く</td><td>ドラッグ＆ドロップが最速</td></tr>
+                <tr><td>対応形式</td><td>Zip / Rar / 7z / 画像 / フォルダ（アーカイブ内アーカイブ対応）</td></tr>
+                <tr><td>しおり・履歴</td><td>読んだ位置は自動記憶。次回続きから</td></tr>
+                <tr><td>動作が重い時</td><td>⚙「動作の軽快さ」でメモリ量を調整</td></tr>
+              </table>
+            </section>
+          </div>
+        </div>
+      </div>
+
+      <!-- キー割り当て変更（≡メニュー「キー割り当てを変更」で開閉） -->
+      <div id="keybind" class="hidden">
+        <div class="grid-toolbar">
+          <span class="grid-title">キー割り当ての変更</span>
+          <button id="keybind-reset">既定に戻す</button>
+          <button id="keybind-close" title="閉じる (Esc)">✕</button>
+        </div>
+        <div id="keybind-scroll">
+          <p class="keybind-note">「変更」を押してから、割り当てたいキーを押してください。同じキーが他の操作に割り当て済みの場合、そちらは未設定になります。</p>
+          <table id="keybind-table"></table>
+        </div>
+      </div>
+
+      <!-- このアプリについて（⚙メニュー「このアプリについて」で開閉） -->
+      <div id="about" class="hidden">
+        <div class="grid-toolbar">
+          <span class="grid-title">MameViewer について</span>
+          <button id="about-close" title="閉じる (Esc)">✕</button>
+        </div>
+        <div id="about-scroll">
+          <p>
+            ローカル専用の漫画・画像ビューアです。「軽快さ」を最優先に設計しています。
+          </p>
+          <p>
+            Mangameeya以来、満足のゆくビューアが見当たらず、自作してみました。ゆっくりと機能を充実させてゆきます。
+          </p>
+          <ul>
+            <li>Zip / Rar / 7z（cbz/cbr/cb7）・画像・フォルダに対応（アーカイブ内アーカイブも自動展開）</li>
+            <li>5ボタンマウスでの片手操作を軸に、キーボード割り当てもカスタマイズ可能</li>
+            <li>見開き表示・綴じ方向・フィット・回転・拡大縮小・ナビゲーターミニマップ</li>
+            <li>読書位置の自動記憶・しおり・サムネイル一覧</li>
+          </ul>
+          <h2>開発元</h2>
+          <p>
+            <a href="https://github.com/ichiyukin/MameViewer" target="_blank" rel="noopener noreferrer">https://github.com/ichiyukin/MameViewer</a>
+          </p>
+          <h2>寄付について</h2>
+          <p>
+            本アプリは<b>寄付制（ドネーションウェア）</b>です。機能制限はありません。気に入っていただけましたら、以下から開発の支援をいただけると励みになります。
+          </p>
+          <ul>
+            <li>GitHub Sponsors（準備中）</li>
+          </ul>
+        </div>
+      </div>
+
+      <!-- サムネイル準備の進捗（読み込み完了数/全体数） -->
+      <div id="progress" class="hidden">
+        <span id="progress-text"></span>
+        <div class="progress-track">
+          <div id="progress-fill"></div>
+        </div>
+      </div>
+
+      <!-- 全体メニュー（≡ で開閉） -->
+      <div id="menu" class="dropdown-menu hidden">
+        <button data-act="open">ファイルを開く</button>
+        <button data-act="openFolder">フォルダを開く</button>
+        <button data-act="grid">サムネイル一覧</button>
+        <button data-act="first">先頭のページへ</button>
+        <button data-act="last">最後のページへ</button>
+        <div class="menu-sep"></div>
+        <button data-act="bookmarkToggle">このページにしおり (B)</button>
+        <button data-act="bookmarkList">しおり一覧 (Ctrl+B)</button>
+        <div class="menu-sep"></div>
+        <span class="menu-label">巻末に達したら</span>
+        <button data-end="loop">同じ巻の先頭に戻る</button>
+        <button data-end="next">次の巻へ進む</button>
+      </div>
+
+      <!-- 設定メニュー（使い方・キー割り当て・動作の軽快さ等、システム的な項目。専用ボタンで開閉） -->
+      <div id="settings-menu" class="dropdown-menu hidden">
+        <button data-act="help">使い方（説明書） (H)</button>
+        <button data-act="keybind">キー割り当てを変更</button>
+        <button data-act="about">このアプリについて</button>
+        <div class="menu-sep"></div>
+        <span class="menu-label">動作の軽快さ（メモリ使用量）</span>
+        <label class="menu-radio"><input type="radio" name="cache-preset" data-mb="256" /> 軽量（約256MB）非力なPC向け</label>
+        <label class="menu-radio"><input type="radio" name="cache-preset" data-mb="512" /> 標準（約512MB）おすすめ</label>
+        <label class="menu-radio"><input type="radio" name="cache-preset" data-mb="1024" /> たっぷり（約1GB）高解像度向け</label>
+        <label class="menu-radio">
+          <input type="radio" name="cache-preset" id="cache-custom-radio" data-mb="custom" />
+          カスタム
+          <input type="number" id="cache-custom-mb" min="64" max="8192" step="64" style="width: 64px" />MB
+        </label>
+        <p class="menu-note">先読みしておく画像の量です。大きいほどページめくりが滑らかになりますが、メモリを多く使います。迷ったら「標準」でOK。</p>
+        <div class="cache-usage">
+          <div class="cache-usage-track"><div id="cache-usage-fill"></div></div>
+          <span id="cache-usage-text"></span>
+        </div>
+      </div>
+
+      <!-- 表示設定メニュー（見開き・回転・フィット。専用ボタンで開閉） -->
+      <div id="display-menu" class="dropdown-menu hidden">
+        <span class="menu-label">表示</span>
+        <button data-act="spread">見開き表示 (D)</button>
+        <button data-act="rotate">回転（クリックで90°ずつ）</button>
+        <div class="menu-sep"></div>
+        <span class="menu-label">フィット</span>
+        <button data-fit="contain">全体に合わせる</button>
+        <button data-fit="width">幅に合わせる</button>
+        <button data-fit="height">高さに合わせる</button>
+        <button data-fit="original">原寸表示</button>
+      </div>
+
+      <!-- ナビゲーター：ズーム中／画像が画面より大きい時に自動表示。クリック/ドラッグでその位置へ -->
+      <div id="navigator-panel" class="hidden">
+        <button id="zoom-reset-btn" title="拡大率をリセット (0キー)">拡大率をリセット</button>
+        <div id="navigator" class="hidden">
+          <img id="nav-thumb" alt="" draggable="false" />
+          <div id="nav-viewport"></div>
+        </div>
+        <div class="nav-panel-row">
+          <button id="nav-hide-btn" title="押している間ナビゲーターを隠して背面の画像を見る">ナビを隠す</button>
+          <button id="nav-fit-btn" title="全体に合わせる表示に切り替え">全体に合わせる</button>
+        </div>
+      </div>
+
+      <!-- 下部コントロールバー -->
+      <div id="bar">
+        <div class="nav">
+          <button id="prev-vol" title="前の巻">◀◀</button>
+          <button id="prev" title="前のページ">◀</button>
+          <button id="next" title="次のページ">▶</button>
+          <button id="next-vol" title="次の巻">▶▶</button>
+          <button id="bind-toggle" title="綴じ方向を切り替え（右綴じ／左綴じ）">
+            📖<span id="bind-arrow">◀</span>
+          </button>
+          <button id="display-menu-btn" title="表示設定（見開き・回転・フィット）">🖼</button>
+          <button id="grid-btn" title="サムネイル一覧 (A)">▦</button>
+          <button id="menu-btn" title="メニュー">≡</button>
+          <button id="settings-menu-btn" title="設定（使い方・キー割り当て・動作の軽快さ）">⚙</button>
+        </div>
+        <input id="seek" type="range" min="0" max="0" value="0" disabled />
+        <span id="counter"></span>
+      </div>
+
+      <!-- 起動時の自動再開確認 -->
+      <div id="resume-dialog" class="hidden">
+        <div class="resume-box">
+          <div class="resume-text">
+            <p class="resume-title">「前回の続き」</p>
+            <p>（<span id="resume-name"></span> / <span id="resume-page"></span>ページ目）</p>
+            <p>から再開しますか？</p>
+          </div>
+          <div class="resume-actions">
+            <div class="resume-actions-main">
+              <button id="resume-continue">続きから</button>
+              <button id="resume-restart">最初から</button>
+            </div>
+            <button id="resume-cancel">新しいファイル</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>

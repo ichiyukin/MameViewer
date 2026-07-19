@@ -1,0 +1,54 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "MameViewer",
+  "version": "0.1.0",
+  "identifier": "com.zigma.mameviewer",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "MameViewer",
+        "width": 900,
+        "height": 700
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "windows": {
+      "wix": { "language": "ja-JP" },
+      "nsis": { "languages": ["Japanese"] }
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "fileAssociations": [
+      {
+        "ext": ["zip", "cbz", "rar", "cbr", "7z", "cb7"],
+        "name": "MameViewer 漫画アーカイブ",
+        "description": "MameViewerで開く漫画・画像アーカイブファイル",
+        "role": "Viewer"
+      },
+      {
+        "ext": ["jpg", "jpeg", "png", "webp", "gif", "avif", "bmp"],
+        "name": "MameViewer 画像ファイル",
+        "description": "MameViewerで開く画像ファイル",
+        "role": "Viewer"
+      }
+    ]
+  }
+}
