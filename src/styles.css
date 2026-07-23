@@ -18,19 +18,123 @@
 }
 
 html,
-body,
-#viewer {
+body {
   width: 100%;
   height: 100vh;
   overflow: hidden;
-  background: #767676; /* 18%グレー（写真の基準グレー） */
+}
+
+/* bodyをフレックスにして、ツリーパネル＋#viewerを横並びにする。 */
+body {
+  display: flex;
 }
 
 #viewer {
+  flex: 1;
+  min-width: 0; /* flex子はデフォルトの縮小最小幅が内容依存になるため明示的に0にしておく */
+  height: 100%;
+  overflow: hidden;
+  background: #767676; /* 18%グレー（写真の基準グレー） */
   position: relative;
   display: flex;
   align-items: center;
   justify-content: center;
+}
+
+/* フォルダツリーサイドパネル */
+#tree-panel {
+  width: 260px;
+  flex-shrink: 0;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: #181818;
+  border-right: 1px solid rgba(255, 255, 255, 0.1);
+}
+#tree-panel.hidden {
+  display: none;
+}
+#tree-toolbar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  background: #1e1e1e;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+#tree-up-btn,
+#tree-locate-btn {
+  flex-shrink: 0;
+  padding: 4px 8px;
+  font-size: 0.78rem;
+  font-family: inherit;
+  color: #eee;
+  background: rgba(255, 255, 255, 0.08);
+  border: none;
+  border-radius: 5px;
+  cursor: pointer;
+}
+#tree-up-btn:hover:not(:disabled),
+#tree-locate-btn:hover {
+  background: rgba(255, 255, 255, 0.18);
+}
+#tree-up-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+#tree-root-path {
+  font-size: 0.75rem;
+  color: #999;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl; /* 長いパスは先頭側(ドライブ文字側)を省略し末尾のフォルダ名を優先表示 */
+  text-align: left;
+}
+#tree-scroll {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 4px 0;
+  font-size: 0.82rem;
+}
+.tree-node {
+  white-space: nowrap;
+}
+.tree-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  color: #ccc;
+}
+.tree-row:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+.tree-row.current {
+  background: rgba(var(--accent-rgb), 0.22);
+  color: #fff;
+  font-weight: 600;
+}
+.tree-row .tree-toggle {
+  flex-shrink: 0;
+  width: 14px;
+  text-align: center;
+  color: #888;
+  font-size: 0.7rem;
+}
+.tree-row .tree-icon {
+  flex-shrink: 0;
+}
+.tree-row .tree-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tree-children {
+  margin-left: 16px;
 }
 
 /* 背景の透かしロゴ：#viewerの背景色の上・他の表示要素の下に来るよう負のz-indexで配置。

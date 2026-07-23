@@ -687,6 +687,73 @@ fn resolve_base_dir(path: &Path) -> Result<PathBuf, String> {
     }
 }
 
+// ---- フォルダツリーパネル ----
+
+#[derive(serde::Serialize)]
+struct TreeEntry {
+    name: String,
+    path: String,
+    #[serde(rename = "isDir")]
+    is_dir: bool,
+    /// アイコン種別："folder" | "archive" | "image" | "other"（isDir=trueの時は無視）。
+    kind: String,
+}
+
+fn entry_kind(name: &str, is_dir: bool) -> String {
+    if is_dir {
+        "folder".to_string()
+    } else if is_archive_ext(name) {
+        "archive".to_string()
+    } else if is_image(name) {
+        "image".to_string()
+    } else {
+        "other".to_string()
+    }
+}
+
+/// 指定フォルダ直下（非再帰）のエントリ一覧を、フォルダ優先＋自然順で返す。
+/// サイドパネルのツリー表示用（クリック時に遅延で子フォルダを取得する）。
+#[tauri::command]
+async fn list_tree_dir(path: String) -> Result<Vec<TreeEntry>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = Path::new(&path);
+        let mut dirs = Vec::new();
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let p = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            let is_dir = p.is_dir();
+            let te = TreeEntry {
+                path: p.to_string_lossy().to_string(),
+                kind: entry_kind(&name, is_dir),
+                name,
+                is_dir,
+            };
+            if is_dir {
+                dirs.push(te);
+            } else {
+                files.push(te);
+            }
+        }
+        dirs.sort_by(|a, b| natural_cmp(&a.name, &b.name));
+        files.sort_by(|a, b| natural_cmp(&a.name, &b.name));
+        dirs.extend(files);
+        Ok(dirs)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// path の親フォルダのパスを返す（ツリーの「上へ」ボタン用）。無ければNone。
+#[tauri::command]
+fn get_parent_dir(path: String) -> Option<String> {
+    Path::new(&path)
+        .parent()
+        .filter(|p| p.as_os_str().len() > 0)
+        .map(|p| p.to_string_lossy().to_string())
+}
+
 /// dir 直下にサブフォルダが存在するか（非再帰・浅い確認）。
 fn has_subfolders_in(dir: &Path) -> Result<bool, String> {
     for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
@@ -1503,7 +1570,9 @@ pub fn run() {
             set_settings,
             get_page_resized,
             get_page_dims,
-            get_launch_path
+            get_launch_path,
+            list_tree_dir,
+            get_parent_dir
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

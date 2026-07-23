@@ -799,7 +799,15 @@ function spreadBoxesFor(
     w: Math.max(1, Math.round(swapped ? h : w)),
     h: Math.max(1, Math.round(swapped ? w : h)),
   });
-  return { left: box(wL, hL), right: box(wR, hR) };
+  // wL・wRをそれぞれ独立に四捨五入すると、合計（dispW）が実際の値より
+  // 最大1px大きくなり得る（単ページの丸め誤差0.5pxの2倍）。これにより
+  // 「全体に合わせる」でぴったり収まっているのに canPan() が誤って true を
+  // 返し、ナビゲーターが表示されたままになる不具合があった。右ページの
+  // 丸めを左ページの誤差ぶん調整し、合計の丸め誤差を単ページ時と同じ
+  // 0.5px以内に収める。
+  const wLRounded = Math.round(wL);
+  const wRRounded = Math.round(wL + wR) - wLRounded;
+  return { left: box(wLRounded, hL), right: box(wRRounded, hR) };
 }
 
 function applyLayoutSpread() {
@@ -1049,6 +1057,161 @@ function updateWindowTitle() {
     .catch(() => {}); // タイトル設定に失敗しても表示には影響しないため無視
 }
 
+// ---- フォルダツリーサイドパネル ----
+// 現在開いているファイル／フォルダの親フォルダを起点に、都度切り替わる。
+// 「上へ」ボタンで階層を遡れる。フォルダはクリックで遅延展開、
+// アーカイブ・画像ファイルはクリックでそのまま開く。
+interface TreeEntry {
+  name: string;
+  path: string;
+  isDir: boolean;
+  kind: "folder" | "archive" | "image" | "other";
+}
+
+const treePanel = document.querySelector<HTMLDivElement>("#tree-panel")!;
+const treeUpBtn = document.querySelector<HTMLButtonElement>("#tree-up-btn")!;
+const treeLocateBtn = document.querySelector<HTMLButtonElement>("#tree-locate-btn")!;
+const treeRootPathEl = document.querySelector<HTMLSpanElement>("#tree-root-path")!;
+const treeScrollEl = document.querySelector<HTMLDivElement>("#tree-scroll")!;
+
+const TREE_ICONS: Record<string, string> = {
+  folder: "📁",
+  archive: "🗜️",
+  image: "🖼️",
+  other: "📄",
+};
+
+let treeRootDir: string | null = null;
+let treeHighlightPath: string | null = null;
+const treeExpanded = new Set<string>();
+const treeChildrenCache = new Map<string, TreeEntry[]>();
+
+async function fetchTreeDir(path: string): Promise<TreeEntry[]> {
+  const cached = treeChildrenCache.get(path);
+  if (cached) return cached;
+  try {
+    const entries = await invoke<TreeEntry[]>("list_tree_dir", { path });
+    treeChildrenCache.set(path, entries);
+    return entries;
+  } catch (e) {
+    console.error("フォルダ一覧取得失敗:", e);
+    treeChildrenCache.set(path, []); // 失敗時は空扱いにして無限リトライを避ける
+    return [];
+  }
+}
+
+function buildTreeLevel(entries: TreeEntry[]): HTMLElement {
+  const container = document.createElement("div");
+  for (const entry of entries) {
+    const node = document.createElement("div");
+    node.className = "tree-node";
+
+    const row = document.createElement("div");
+    row.className = "tree-row" + (entry.path === treeHighlightPath ? " current" : "");
+    row.title = entry.path;
+
+    const toggle = document.createElement("span");
+    toggle.className = "tree-toggle";
+    toggle.textContent = entry.isDir ? (treeExpanded.has(entry.path) ? "▼" : "▶") : "";
+
+    const icon = document.createElement("span");
+    icon.className = "tree-icon";
+    icon.textContent = TREE_ICONS[entry.isDir ? "folder" : entry.kind] ?? "📄";
+
+    const name = document.createElement("span");
+    name.className = "tree-name";
+    name.textContent = entry.name;
+
+    row.append(toggle, icon, name);
+    row.addEventListener("click", () => {
+      if (entry.isDir) toggleTreeNode(entry.path);
+      else if (entry.kind === "archive" || entry.kind === "image") openPath(entry.path);
+    });
+    node.appendChild(row);
+
+    if (entry.isDir && treeExpanded.has(entry.path)) {
+      const childrenWrap = document.createElement("div");
+      childrenWrap.className = "tree-children";
+      const cached = treeChildrenCache.get(entry.path);
+      if (cached) {
+        childrenWrap.appendChild(buildTreeLevel(cached));
+      } else {
+        const loading = document.createElement("p");
+        loading.textContent = "読み込み中…";
+        loading.style.cssText = "padding:3px 8px;color:#888;";
+        childrenWrap.appendChild(loading);
+      }
+      node.appendChild(childrenWrap);
+    }
+    container.appendChild(node);
+  }
+  return container;
+}
+
+function renderTree() {
+  treeScrollEl.innerHTML = "";
+  if (!treeRootDir) return;
+  const rootEntries = treeChildrenCache.get(treeRootDir);
+  if (!rootEntries) {
+    const loading = document.createElement("p");
+    loading.textContent = "読み込み中…";
+    loading.style.cssText = "padding:8px 12px;color:#888;";
+    treeScrollEl.appendChild(loading);
+    return;
+  }
+  treeScrollEl.appendChild(buildTreeLevel(rootEntries));
+}
+
+async function toggleTreeNode(path: string) {
+  if (treeExpanded.has(path)) {
+    treeExpanded.delete(path);
+    renderTree();
+    return;
+  }
+  treeExpanded.add(path);
+  renderTree(); // 展開直後（読み込み中）の状態を即座に見せる
+  await fetchTreeDir(path);
+  renderTree();
+}
+
+// ツリーの表示起点を切り替える。highlightPathを指定すると、その項目を強調表示する。
+async function setTreeRoot(dir: string, highlightPath: string | null) {
+  treeRootDir = dir;
+  treeHighlightPath = highlightPath;
+  treeRootPathEl.textContent = dir;
+  treeRootPathEl.title = dir;
+  renderTree(); // 読み込み中表示を即座に見せる
+  await fetchTreeDir(dir);
+  const parent = await invoke<string | null>("get_parent_dir", { path: dir }).catch(() => null);
+  treeUpBtn.disabled = !parent;
+  renderTree();
+}
+
+// 開いたファイル／フォルダ（アンカー）に応じてツリーの起点を更新する。
+// アンカー自身の親フォルダを起点にし、アンカー自身をハイライトする。
+async function setTreeRootForAnchor(anchor: string) {
+  const parent = await invoke<string | null>("get_parent_dir", { path: anchor }).catch(() => null);
+  await setTreeRoot(parent ?? anchor, anchor);
+}
+
+async function goTreeUp() {
+  if (!treeRootDir) return;
+  const parent = await invoke<string | null>("get_parent_dir", { path: treeRootDir }).catch(() => null);
+  if (parent) await setTreeRoot(parent, treeHighlightPath);
+}
+
+treeUpBtn.addEventListener("click", goTreeUp);
+
+// 現在見ているファイル／フォルダの位置へ、ツリーの起点を戻す。
+treeLocateBtn.addEventListener("click", () => {
+  if (currentAnchor) setTreeRootForAnchor(currentAnchor);
+});
+
+// フォルダツリーパネルの表示/非表示を切り替える。
+document.querySelector<HTMLButtonElement>("#tree-toggle-btn")?.addEventListener("click", () => {
+  treePanel.classList.toggle("hidden");
+});
+
 // ---- アーカイブを開く ----
 // reset=true の場合、記憶されている位置を無視して先頭ページから開く（「最初から読む」用）。
 async function openArchive(path: string, reset = false) {
@@ -1065,6 +1228,7 @@ async function openArchive(path: string, reset = false) {
     current = res.initialIndex;
     currentAnchor = path;
     updateWindowTitle();
+    setTreeRootForAnchor(path);
     hint.style.display = "none";
     seek.disabled = false;
     seek.max = String(pageCount - 1);
@@ -1102,6 +1266,7 @@ async function openImageOrFolder(path: string, reset = false) {
     current = res.initialIndex;
     currentAnchor = res.dir;
     updateWindowTitle();
+    setTreeRootForAnchor(res.dir);
     hint.style.display = "none";
     seek.disabled = false;
     seek.max = String(pageCount - 1);

@@ -9,6 +9,16 @@
   </head>
 
   <body>
+    <!-- フォルダツリー：常時表示のサイドパネル。現在開いているファイル/フォルダの
+         親フォルダを起点に、上へボタンで階層を遡れる。 -->
+    <div id="tree-panel">
+      <div id="tree-toolbar">
+        <button id="tree-up-btn" title="上の階層へ">⬆ 上へ</button>
+        <button id="tree-locate-btn" title="現在見ているファイルの位置へ戻る">🎯</button>
+        <span id="tree-root-path"></span>
+      </div>
+      <div id="tree-scroll"></div>
+    </div>
     <div id="viewer">
       <!-- 背景の透かしロゴ。#viewer自身の背景色より上・他の表示より下に負のz-indexで配置 -->
       <img id="bg-watermark" src="/watermark.png" alt="" draggable="false" />
@@ -227,6 +237,7 @@
       <!-- 下部コントロールバー -->
       <div id="bar">
         <div class="nav">
+          <button id="tree-toggle-btn" title="フォルダツリーの表示切替">🌳</button>
           <button id="prev-vol" title="前の巻">◀◀</button>
           <button id="prev" title="前のページ">◀</button>
           <button id="next" title="次のページ">▶</button>
