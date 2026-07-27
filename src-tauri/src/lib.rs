@@ -478,6 +478,126 @@ fn find_bookmark(anchor: String, page: usize) -> Option<u64> {
         .map(|b| b.id)
 }
 
+// ---- 本棚（本＝ファイル/フォルダ単位のお気に入り） ----
+// しおり（ページ単位）とは別に、「また読みたい本」を表紙付きで並べておくための機能。
+// 保存先は bookmarks.json と同じ %APPDATA%\MameViewer\ 配下。
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct ShelfItem {
+    /// 本の識別パス（アーカイブファイル or フォルダの基点パス）。
+    anchor: String,
+    #[serde(rename = "fileName")]
+    file_name: String,
+    /// 表紙サムネイル（登録時のページ）。元ファイルが消えても一覧で中身が分かるように埋め込む。
+    #[serde(rename = "thumbBase64")]
+    thumb_base64: String,
+    /// 登録日時（UNIXエポック秒）。新しい順に並べるため。
+    #[serde(rename = "addedAt", default)]
+    added_at: u64,
+}
+
+/// フロントへ返す表示用ビュー。exists はアンカーが今も存在するか。
+#[derive(serde::Serialize)]
+struct ShelfItemView {
+    anchor: String,
+    #[serde(rename = "fileName")]
+    file_name: String,
+    #[serde(rename = "thumbBase64")]
+    thumb_base64: String,
+    exists: bool,
+}
+
+fn shelf_path() -> PathBuf {
+    let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(base).join("MameViewer").join("shelf.json")
+}
+
+fn load_shelf_from_disk() -> Vec<ShelfItem> {
+    std::fs::read_to_string(shelf_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn persist_shelf(list: &[ShelfItem]) {
+    let path = shelf_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(list) {
+        let _ = std::fs::write(&path, json);
+    }
+}
+
+static SHELF: LazyLock<Mutex<Vec<ShelfItem>>> = LazyLock::new(|| Mutex::new(load_shelf_from_disk()));
+
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 現在の本を本棚に追加する（既に登録済みなら表紙だけ更新）。page は表紙に使うページ番号。
+#[tauri::command]
+async fn add_to_shelf(anchor: String, page: usize) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let thumb = make_thumbnail(page)?;
+        let thumb_base64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &*thumb);
+        let file_name = Path::new(&anchor)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let mut list = SHELF.lock().unwrap();
+        if let Some(existing) = list.iter_mut().find(|s| s.anchor == anchor) {
+            existing.thumb_base64 = thumb_base64;
+        } else {
+            list.push(ShelfItem {
+                anchor,
+                file_name,
+                thumb_base64,
+                added_at: now_epoch_secs(),
+            });
+        }
+        persist_shelf(&list);
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+fn remove_from_shelf(anchor: String) -> Result<(), String> {
+    let mut list = SHELF.lock().unwrap();
+    list.retain(|s| s.anchor != anchor);
+    persist_shelf(&list);
+    Ok(())
+}
+
+/// 本棚の一覧を、登録が新しい順に返す。
+#[tauri::command]
+fn list_shelf() -> Vec<ShelfItemView> {
+    let list = SHELF.lock().unwrap();
+    let mut items: Vec<&ShelfItem> = list.iter().collect();
+    items.sort_by(|a, b| b.added_at.cmp(&a.added_at));
+    items
+        .into_iter()
+        .map(|s| ShelfItemView {
+            anchor: s.anchor.clone(),
+            file_name: s.file_name.clone(),
+            thumb_base64: s.thumb_base64.clone(),
+            exists: Path::new(&s.anchor).exists(),
+        })
+        .collect()
+}
+
+/// 指定の本が本棚に登録済みか（ボタンのトグル表示用）。
+#[tauri::command]
+fn is_in_shelf(anchor: String) -> bool {
+    SHELF.lock().unwrap().iter().any(|s| s.anchor == anchor)
+}
+
 /// サムネイルのキャッシュ（ページ番号 -> JPEGバイト列）。アーカイブを開くたびにクリア。
 static THUMBS: LazyLock<Mutex<HashMap<usize, Arc<Vec<u8>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -697,6 +817,10 @@ struct TreeEntry {
     is_dir: bool,
     /// アイコン種別："folder" | "archive" | "image" | "other"（isDir=trueの時は無視）。
     kind: String,
+    /// 更新日時（UNIXエポック秒）。取得できない場合は0。フロントの並び替えに使う。
+    mtime: u64,
+    /// ファイルサイズ（バイト）。フォルダは0。フロントの並び替えに使う。
+    size: u64,
 }
 
 fn entry_kind(name: &str, is_dir: bool) -> String {
@@ -724,11 +848,26 @@ async fn list_tree_dir(path: String) -> Result<Vec<TreeEntry>, String> {
             let p = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
             let is_dir = p.is_dir();
+            // メタ情報が読めない項目（アクセス権限等）は 0 扱いにして一覧から落とさない。
+            let meta = entry.metadata().ok();
+            let mtime = meta
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let size = if is_dir {
+                0
+            } else {
+                meta.as_ref().map(|m| m.len()).unwrap_or(0)
+            };
             let te = TreeEntry {
                 path: p.to_string_lossy().to_string(),
                 kind: entry_kind(&name, is_dir),
                 name,
                 is_dir,
+                mtime,
+                size,
             };
             if is_dir {
                 dirs.push(te);
@@ -1572,7 +1711,11 @@ pub fn run() {
             get_page_dims,
             get_launch_path,
             list_tree_dir,
-            get_parent_dir
+            get_parent_dir,
+            add_to_shelf,
+            remove_from_shelf,
+            list_shelf,
+            is_in_shelf
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

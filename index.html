@@ -9,13 +9,34 @@
   </head>
 
   <body>
-    <!-- フォルダツリー：常時表示のサイドパネル。現在開いているファイル/フォルダの
+    <!-- 上部コントロールバー：常時表示。画像領域の上に固定の帯として場所を取る -->
+    <div id="topbar">
+      <div class="nav">
+        <button id="menu-btn" title="メニュー">≡</button>
+        <button id="tree-toggle-btn" title="フォルダツリーの表示切替">📁</button>
+        <button id="display-menu-btn" title="表示設定（見開き・回転・フィット）">🖼</button>
+        <button id="bind-toggle" title="綴じ方向を切り替え（右綴じ／左綴じ）">
+          📖<span id="bind-arrow">◀</span>
+        </button>
+        <button id="settings-menu-btn" title="設定（使い方・キー割り当て・動作の軽快さ）">⚙</button>
+      </div>
+    </div>
+
+    <div id="main-row">
+    <!-- フォルダツリー：サイドパネル（📁ボタンで開閉）。現在開いているファイル/フォルダの
          親フォルダを起点に、上へボタンで階層を遡れる。 -->
-    <div id="tree-panel">
+    <div id="tree-panel" class="hidden">
       <div id="tree-toolbar">
         <button id="tree-up-btn" title="上の階層へ">⬆ 上へ</button>
         <button id="tree-locate-btn" title="現在見ているファイルの位置へ戻る">🎯</button>
         <span id="tree-root-path"></span>
+      </div>
+      <!-- 並び替え：同じボタンを押すたびに昇順／降順が入れ替わる -->
+      <div id="tree-sortbar">
+        <button data-sort="name" title="名前で並び替え">名前</button>
+        <button data-sort="date" title="更新日で並び替え">更新日</button>
+        <button data-sort="kind" title="種類で並び替え">種類</button>
+        <button data-sort="size" title="サイズで並び替え">サイズ</button>
       </div>
       <div id="tree-scroll"></div>
     </div>
@@ -91,15 +112,18 @@
               </table>
             </section>
             <section>
-              <h2>画面のボタン</h2>
+              <h2>画面のボタン（上下端にカーソルを寄せると出現）</h2>
               <table>
+                <tr><td>≡（上部）</td><td>メニュー（開く・しおり・巻末動作）</td></tr>
+                <tr><td>📁（上部）</td><td>フォルダツリーの表示切替</td></tr>
+                <tr><td>🖼（上部）</td><td>見開き・回転・フィット</td></tr>
+                <tr><td>📖（上部）</td><td>綴じ方向切替（矢印＝読む方向）</td></tr>
+                <tr><td>⚙（上部）</td><td>設定（使い方・キー割り当て・メモリ）</td></tr>
                 <tr><td>◀◀ / ▶▶</td><td>前 / 次の巻</td></tr>
                 <tr><td>◀ / ▶</td><td>1ページ前 / 次</td></tr>
-                <tr><td>📖</td><td>綴じ方向切替（矢印＝読む方向）</td></tr>
-                <tr><td>🖼</td><td>見開き・回転・フィット</td></tr>
+                <tr><td>🔖</td><td>このページにしおり（点灯＝登録中）</td></tr>
+                <tr><td>📚</td><td>本棚（お気に入りの本を並べる）</td></tr>
                 <tr><td>▦</td><td>サムネイル一覧</td></tr>
-                <tr><td>≡</td><td>メニュー（開く・しおり・巻末動作）</td></tr>
-                <tr><td>⚙</td><td>設定（使い方・キー割り当て・メモリ）</td></tr>
                 <tr><td>ナビゲーター</td><td>拡大中の位置表示。クリックで移動</td></tr>
               </table>
             </section>
@@ -234,21 +258,26 @@
         </div>
       </div>
 
+      <!-- 本棚：お気に入りの本を画面下部に横一列で並べる（📚ボタンで開閉） -->
+      <div id="shelf" class="hidden">
+        <div id="shelf-toolbar">
+          <span class="shelf-title">📚 本棚</span>
+          <button id="shelf-add-btn" title="今読んでいる本を本棚に追加／削除">この本を追加</button>
+          <button id="shelf-close" title="閉じる">✕</button>
+        </div>
+        <div id="shelf-scroll"></div>
+      </div>
+
       <!-- 下部コントロールバー -->
       <div id="bar">
         <div class="nav">
-          <button id="tree-toggle-btn" title="フォルダツリーの表示切替">🌳</button>
           <button id="prev-vol" title="前の巻">◀◀</button>
           <button id="prev" title="前のページ">◀</button>
           <button id="next" title="次のページ">▶</button>
           <button id="next-vol" title="次の巻">▶▶</button>
-          <button id="bind-toggle" title="綴じ方向を切り替え（右綴じ／左綴じ）">
-            📖<span id="bind-arrow">◀</span>
-          </button>
-          <button id="display-menu-btn" title="表示設定（見開き・回転・フィット）">🖼</button>
+          <button id="bookmark-btn" title="このページにしおりを挟む (B)">🔖</button>
+          <button id="shelf-btn" title="本棚（お気に入りの本）">📚</button>
           <button id="grid-btn" title="サムネイル一覧 (A)">▦</button>
-          <button id="menu-btn" title="メニュー">≡</button>
-          <button id="settings-menu-btn" title="設定（使い方・キー割り当て・動作の軽快さ）">⚙</button>
         </div>
         <input id="seek" type="range" min="0" max="0" value="0" disabled />
         <span id="counter"></span>
@@ -271,6 +300,7 @@
           </div>
         </div>
       </div>
+    </div>
     </div>
   </body>
 </html>

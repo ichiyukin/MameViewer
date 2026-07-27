@@ -334,6 +334,7 @@ function release() {
 const img = document.querySelector<HTMLImageElement>("#page")!;
 const hint = document.querySelector<HTMLDivElement>("#hint")!;
 const bar = document.querySelector<HTMLDivElement>("#bar")!;
+const topbar = document.querySelector<HTMLDivElement>("#topbar")!;
 const counter = document.querySelector<HTMLSpanElement>("#counter")!;
 const seek = document.querySelector<HTMLInputElement>("#seek")!;
 const menu = document.querySelector<HTMLDivElement>("#menu")!;
@@ -894,6 +895,7 @@ async function renderSingle() {
     flashBar();
     prefetch();
     updateNavigatorThumb();
+    updateBookmarkBtnUi();
   } catch (e) {
     console.error("ページ取得失敗:", e);
   }
@@ -958,6 +960,7 @@ async function renderSpread() {
     flashBar();
     prefetch();
     updateNavigatorThumb();
+    updateBookmarkBtnUi();
   } catch (e) {
     console.error("見開きページ取得失敗:", e);
   }
@@ -1066,7 +1069,11 @@ interface TreeEntry {
   path: string;
   isDir: boolean;
   kind: "folder" | "archive" | "image" | "other";
+  mtime: number; // 更新日時（UNIXエポック秒）
+  size: number; // バイト数（フォルダは0）
 }
+
+type TreeSortKey = "name" | "date" | "kind" | "size";
 
 const treePanel = document.querySelector<HTMLDivElement>("#tree-panel")!;
 const treeUpBtn = document.querySelector<HTMLButtonElement>("#tree-up-btn")!;
@@ -1084,6 +1091,38 @@ const TREE_ICONS: Record<string, string> = {
 let treeRootDir: string | null = null;
 let treeHighlightPath: string | null = null;
 const treeExpanded = new Set<string>();
+
+// 並び替え設定（次回起動時も維持）。
+let treeSortKey: TreeSortKey = (localStorage.getItem("treeSortKey") as TreeSortKey | null) || "name";
+let treeSortAsc = localStorage.getItem("treeSortAsc") !== "false";
+
+// 種類の並び順（フォルダ→アーカイブ→画像→その他）。
+const KIND_ORDER: Record<string, number> = { folder: 0, archive: 1, image: 2, other: 3 };
+
+// 表示用に並び替えた配列を返す（元の配列は壊さない）。
+// フォルダは常に先頭にまとめ、その中で選択中のキーで並べる
+// （エクスプローラー等と同じく、フォルダとファイルが混ざらない方が探しやすいため）。
+function sortedTreeEntries(entries: TreeEntry[]): TreeEntry[] {
+  const dir = treeSortAsc ? 1 : -1;
+  return [...entries].sort((a, b) => {
+    if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+    let cmp = 0;
+    switch (treeSortKey) {
+      case "date":
+        cmp = a.mtime - b.mtime;
+        break;
+      case "size":
+        cmp = a.size - b.size;
+        break;
+      case "kind":
+        cmp = (KIND_ORDER[a.kind] ?? 9) - (KIND_ORDER[b.kind] ?? 9);
+        break;
+    }
+    // 名前順、または上記キーが同値だった場合は名前で決着させる。
+    if (cmp === 0) return a.name.localeCompare(b.name, "ja", { numeric: true }) * dir;
+    return cmp * dir;
+  });
+}
 const treeChildrenCache = new Map<string, TreeEntry[]>();
 
 async function fetchTreeDir(path: string): Promise<TreeEntry[]> {
@@ -1102,7 +1141,7 @@ async function fetchTreeDir(path: string): Promise<TreeEntry[]> {
 
 function buildTreeLevel(entries: TreeEntry[]): HTMLElement {
   const container = document.createElement("div");
-  for (const entry of entries) {
+  for (const entry of sortedTreeEntries(entries)) {
     const node = document.createElement("div");
     node.className = "tree-node";
 
@@ -1212,6 +1251,35 @@ document.querySelector<HTMLButtonElement>("#tree-toggle-btn")?.addEventListener(
   treePanel.classList.toggle("hidden");
 });
 
+// ---- ツリーの並び替え ----
+// 選択中のキーは強調表示し、昇順／降順を矢印で示す。
+function updateTreeSortUi() {
+  for (const b of document.querySelectorAll<HTMLButtonElement>("#tree-sortbar button")) {
+    const key = b.dataset.sort as TreeSortKey;
+    const active = key === treeSortKey;
+    b.classList.toggle("active", active);
+    const label = b.dataset.label ?? (b.dataset.label = b.textContent ?? "");
+    b.textContent = active ? `${label}${treeSortAsc ? "▲" : "▼"}` : label;
+  }
+}
+
+for (const b of document.querySelectorAll<HTMLButtonElement>("#tree-sortbar button")) {
+  b.addEventListener("click", () => {
+    const key = b.dataset.sort as TreeSortKey;
+    // 同じキーを再度押した場合は昇順／降順を反転、別のキーなら昇順から。
+    if (key === treeSortKey) treeSortAsc = !treeSortAsc;
+    else {
+      treeSortKey = key;
+      treeSortAsc = true;
+    }
+    localStorage.setItem("treeSortKey", treeSortKey);
+    localStorage.setItem("treeSortAsc", String(treeSortAsc));
+    updateTreeSortUi();
+    renderTree();
+  });
+}
+updateTreeSortUi();
+
 // ---- アーカイブを開く ----
 // reset=true の場合、記憶されている位置を無視して先頭ページから開く（「最初から読む」用）。
 async function openArchive(path: string, reset = false) {
@@ -1228,6 +1296,7 @@ async function openArchive(path: string, reset = false) {
     current = res.initialIndex;
     currentAnchor = path;
     updateWindowTitle();
+    if (shelfOpen) updateShelfAddBtnUi(); // 別の本を開いたら追加/削除の表示を切り替える
     setTreeRootForAnchor(path);
     hint.style.display = "none";
     seek.disabled = false;
@@ -1266,6 +1335,7 @@ async function openImageOrFolder(path: string, reset = false) {
     current = res.initialIndex;
     currentAnchor = res.dir;
     updateWindowTitle();
+    if (shelfOpen) updateShelfAddBtnUi(); // 別の本を開いたら追加/削除の表示を切り替える
     setTreeRootForAnchor(res.dir);
     hint.style.display = "none";
     seek.disabled = false;
@@ -1342,25 +1412,31 @@ function flashBar() {
   bar.classList.add("show");
   window.clearTimeout(barTimer);
   barTimer = window.setTimeout(() => {
-    if (
-      menu.classList.contains("hidden") &&
-      displayMenu.classList.contains("hidden") &&
-      settingsMenu.classList.contains("hidden")
-    ) {
-      bar.classList.remove("show");
-    }
+    bar.classList.remove("show");
   }, 1400);
 }
 
+// 上部バーは常時表示のため、下部バーのような自動開閉の制御は持たない。
+
 // ---- メニュー（≡：ファイル操作・しおり・巻末挙動・キャッシュ設定） ----
 // メニューの右端を、開くきっかけになったボタンの右端に揃えて表示する
-// （画面右端に固定していると、ボタンとメニューの位置関係が不自然に見えるため）。
+// （画面端に固定していると、ボタンとメニューの位置関係が不自然に見えるため）。
+// ボタンは上部バーにあるので、バーの直下から下向きに開く。
 function positionMenuAboveButton(menuEl: HTMLElement, btn: HTMLElement) {
   const btnRect = btn.getBoundingClientRect();
-  const barRect = bar.getBoundingClientRect();
-  menuEl.style.left = "auto";
-  menuEl.style.right = `${Math.max(4, window.innerWidth - btnRect.right)}px`;
-  menuEl.style.bottom = `${Math.max(4, window.innerHeight - barRect.top)}px`;
+  const barRect = topbar.getBoundingClientRect();
+  // メニューは #viewer の子（position:absolute の基準が #viewer）。上部バーは
+  // #viewer の外にあるため、ビューポート座標から #viewer の位置を引いて換算する。
+  const viewerRect = viewer.getBoundingClientRect();
+  menuEl.style.right = "auto";
+  menuEl.style.bottom = "auto";
+  menuEl.style.top = `${Math.max(4, barRect.bottom - viewerRect.top + 4)}px`;
+  // メニューの左端をボタンの左端に合わせる。ただし画面右端からはみ出す場合は
+  // 内側へ寄せる（ボタンが右端にある場合でも見切れないように）。
+  // hidden を外した後に呼ぶ前提なので offsetWidth で実寸を測れる。
+  const maxLeft = Math.max(4, viewerRect.width - menuEl.offsetWidth - 4);
+  const left = Math.min(Math.max(4, btnRect.left - viewerRect.left), maxLeft);
+  menuEl.style.left = `${left}px`;
 }
 
 function toggleMenu(force?: boolean) {
@@ -1371,7 +1447,6 @@ function toggleMenu(force?: boolean) {
     toggleSettingsMenu(false);
     const btn = document.querySelector<HTMLButtonElement>("#menu-btn")!;
     positionMenuAboveButton(menu, btn);
-    bar.classList.add("show");
   }
 }
 
@@ -1383,7 +1458,6 @@ function toggleSettingsMenu(force?: boolean) {
     toggleDisplayMenu(false);
     const btn = document.querySelector<HTMLButtonElement>("#settings-menu-btn")!;
     positionMenuAboveButton(settingsMenu, btn);
-    bar.classList.add("show");
   }
 }
 
@@ -1550,7 +1624,6 @@ function toggleDisplayMenu(force?: boolean) {
     toggleSettingsMenu(false);
     const btn = document.querySelector<HTMLButtonElement>("#display-menu-btn")!;
     positionMenuAboveButton(displayMenu, btn);
-    bar.classList.add("show");
   }
 }
 
@@ -1799,6 +1872,29 @@ const bookmarksScroll = document.querySelector<HTMLDivElement>("#bookmarks-scrol
 const bmClearBrokenBtn = document.querySelector<HTMLButtonElement>("#bm-clear-broken")!;
 
 // 現在のページのしおりを登録／解除する（トグル）。
+// しおりボタンの見た目を、現在ページが登録済みかどうかで切り替える
+// （どこにしおりを挟んだかが一目で分かるように）。
+const bookmarkBtn = document.querySelector<HTMLButtonElement>("#bookmark-btn")!;
+
+async function updateBookmarkBtnUi() {
+  let marked = false;
+  if (currentAnchor && pageCount > 0) {
+    try {
+      const id = await invoke<number | null>("find_bookmark", {
+        anchor: currentAnchor,
+        page: current,
+      });
+      marked = id != null;
+    } catch {
+      marked = false;
+    }
+  }
+  bookmarkBtn.classList.toggle("marked", marked);
+  bookmarkBtn.title = marked
+    ? "このページのしおりを外す (B)"
+    : "このページにしおりを挟む (B)";
+}
+
 async function toggleBookmark() {
   if (!currentAnchor || pageCount === 0) return;
   try {
@@ -1812,10 +1908,125 @@ async function toggleBookmark() {
       await invoke("add_bookmark", { anchor: currentAnchor, page: current });
     }
     if (bmOpen) await buildBookmarksList();
+    updateBookmarkBtnUi();
   } catch (e) {
     console.error("しおり操作に失敗:", e);
   }
 }
+
+bookmarkBtn.addEventListener("click", toggleBookmark);
+
+// ---- 本棚（本＝ファイル単位のお気に入り） ----
+interface ShelfItemView {
+  anchor: string;
+  fileName: string;
+  thumbBase64: string;
+  exists: boolean;
+}
+
+let shelfOpen = false;
+const shelfEl = document.querySelector<HTMLDivElement>("#shelf")!;
+const shelfScrollEl = document.querySelector<HTMLDivElement>("#shelf-scroll")!;
+const shelfAddBtn = document.querySelector<HTMLButtonElement>("#shelf-add-btn")!;
+
+async function buildShelfList() {
+  try {
+    const items = await invoke<ShelfItemView[]>("list_shelf");
+    shelfScrollEl.innerHTML = "";
+    if (items.length === 0) {
+      const empty = document.createElement("p");
+      empty.className = "shelf-empty";
+      empty.textContent =
+        "本棚は空です。読みたい本を開いて「この本を追加」を押すと、ここに並びます。";
+      shelfScrollEl.appendChild(empty);
+      return;
+    }
+    for (const item of items) {
+      const cell = document.createElement("div");
+      cell.className = "shelf-item" + (item.exists ? "" : " broken");
+      cell.title = item.exists ? item.anchor : `${item.anchor}（見つかりません）`;
+
+      const img = document.createElement("img");
+      img.src = `data:image/jpeg;base64,${item.thumbBase64}`;
+      img.alt = "";
+      img.draggable = false;
+
+      const name = document.createElement("div");
+      name.className = "shelf-name";
+      name.textContent = item.fileName;
+
+      const removeBtn = document.createElement("button");
+      removeBtn.className = "shelf-remove";
+      removeBtn.textContent = "✕";
+      removeBtn.title = "本棚から外す";
+      removeBtn.addEventListener("click", async (e) => {
+        e.stopPropagation(); // 本を開く動作と競合させない
+        await invoke("remove_from_shelf", { anchor: item.anchor }).catch(() => {});
+        await buildShelfList();
+        updateShelfAddBtnUi();
+      });
+
+      if (item.exists) {
+        // 本を選んだら棚は閉じる（サムネイル一覧・しおり一覧と同じ挙動。
+        // 開いたままだと画面下部が塞がり、パン操作の邪魔になるため）。
+        cell.addEventListener("click", () => {
+          toggleShelf(false);
+          openPath(item.anchor);
+        });
+      }
+      cell.append(img, name, removeBtn);
+      shelfScrollEl.appendChild(cell);
+    }
+  } catch (e) {
+    console.error("本棚の読み込みに失敗:", e);
+  }
+}
+
+// 「この本を追加」ボタンを、現在の本が登録済みかどうかで追加／削除に切り替える。
+async function updateShelfAddBtnUi() {
+  if (!currentAnchor) {
+    shelfAddBtn.disabled = true;
+    shelfAddBtn.textContent = "この本を追加";
+    shelfAddBtn.classList.remove("remove");
+    return;
+  }
+  shelfAddBtn.disabled = false;
+  const inShelf = await invoke<boolean>("is_in_shelf", { anchor: currentAnchor }).catch(
+    () => false
+  );
+  shelfAddBtn.textContent = inShelf ? "この本を本棚から外す" : "この本を追加";
+  shelfAddBtn.classList.toggle("remove", inShelf);
+}
+
+shelfAddBtn.addEventListener("click", async () => {
+  if (!currentAnchor || pageCount === 0) return;
+  try {
+    const inShelf = await invoke<boolean>("is_in_shelf", { anchor: currentAnchor });
+    if (inShelf) {
+      await invoke("remove_from_shelf", { anchor: currentAnchor });
+    } else {
+      // 表紙には現在表示中のページを使う（好きな場面を表紙にできる）。
+      await invoke("add_to_shelf", { anchor: currentAnchor, page: current });
+    }
+    await buildShelfList();
+    updateShelfAddBtnUi();
+  } catch (e) {
+    console.error("本棚の更新に失敗:", e);
+  }
+});
+
+async function toggleShelf(force?: boolean) {
+  shelfOpen = force ?? !shelfOpen;
+  shelfEl.classList.toggle("hidden", !shelfOpen);
+  if (shelfOpen) {
+    bar.classList.add("show"); // 本棚は下部バーの上に出るため、バーも一緒に見せる
+    await buildShelfList();
+    updateShelfAddBtnUi();
+  }
+}
+
+document.querySelector<HTMLButtonElement>("#shelf-btn")!.addEventListener("click", () => toggleShelf());
+document.querySelector<HTMLButtonElement>("#shelf-close")!.addEventListener("click", () => toggleShelf(false));
 
 async function jumpToBookmark(bm: BookmarkView) {
   closeBookmarks();
@@ -1926,6 +2137,7 @@ window.addEventListener(
   "wheel",
   (e) => {
     if (helpOpen || keybindOpen || aboutOpen) return; // パネル表示中は通常のスクロールに任せる
+    if (onUi(e)) return; // フォルダツリー等のUI上ではページめくりせず、その要素のスクロールに任せる
     if (gridOpen) {
       if (e.ctrlKey) {
         e.preventDefault();
@@ -1956,7 +2168,7 @@ window.addEventListener(
 // UI領域（バー・メニュー・一覧・案内）上のクリックはページ送りに使わない
 function onUi(e: Event): boolean {
   return !!(e.target as HTMLElement).closest(
-    "#bar, #menu, #display-menu, #settings-menu, #grid, #hint, #bookmarks, #resume-dialog, #help, #keybind, #about"
+    "#tree-panel, #shelf, #bar, #topbar, #menu, #display-menu, #settings-menu, #grid, #hint, #bookmarks, #resume-dialog, #help, #keybind, #about"
   );
 }
 
@@ -1999,7 +2211,7 @@ window.addEventListener("mouseup", (e) => {
   if (e.button === 4) {
     s2Down = false;
   }
-  if (gridOpen) return;
+  if (gridOpen || onUi(e)) return; // フォルダツリー等のUI上ではページ移動を発火させない
   if (e.button === 3) {
     e.preventDefault();
     if (s1UsedForZoom) {
@@ -2118,7 +2330,7 @@ window.addEventListener("blur", () => {
   viewer.style.cursor = canPan() ? "grab" : "";
 });
 
-// マウスを画面下端に寄せたらバー表示／パン中は画像位置を更新
+// マウスを画面上端／下端に寄せたらバー表示／パン中は画像位置を更新
 window.addEventListener("mousemove", (e) => {
   if (panning) {
     const { maxX, maxY } = panLimits();
@@ -2128,7 +2340,8 @@ window.addEventListener("mousemove", (e) => {
     updateNavigatorViewportRect(); // ドラッグ中もミニマップの青枠を追従させる
     return;
   }
-  if (!gridOpen && e.clientY > window.innerHeight - 64) flashBar();
+  if (gridOpen) return;
+  if (e.clientY > window.innerHeight - 64) flashBar();
 });
 
 // バー・一覧の操作
