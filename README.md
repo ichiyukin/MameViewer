@@ -22,6 +22,11 @@ npm install
 npm run tauri dev
 ```
 
+## 不具合報告・お問い合わせ
+
+- [GitHub Issues](https://github.com/ichiyukin/MameViewer/issues)（推奨）
+- メール：nuralyhyone@gmail.com
+
 ## 寄付について
 
 本アプリは**寄付制（ドネーションウェア）**です。機能制限はありません。気に入っていただけましたら、[GitHub Sponsors](https://github.com/sponsors/ichiyukin) から開発の支援をいただけると励みになります。
