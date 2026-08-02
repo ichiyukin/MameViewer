@@ -255,7 +255,7 @@ static RESIZED_CACHE: LazyLock<Mutex<HashMap<(usize, u32, u32), Arc<Vec<u8>>>>> 
 /// ページを実際にデコード・指定サイズへリサイズしてJPEGへエンコードする（重い処理）。
 fn render_page_resized(index: usize, width: u32, height: u32) -> Result<Vec<u8>, String> {
     let raw = read_page_bytes(index)?;
-    let img = image::load_from_memory(&raw).map_err(|e| format!("画像デコード失敗: {e}"))?;
+    let img = image::load_from_memory(&raw[..]).map_err(|e| format!("画像デコード失敗: {e}"))?;
     let (nw, nh) = (img.width(), img.height());
     let settings = SETTINGS.lock().unwrap().clone();
     let filter = resolve_filter(&settings, nw, nh, width.max(1), height.max(1));
@@ -300,7 +300,7 @@ async fn get_page_resized(index: usize, width: u32, height: u32) -> Result<tauri
 async fn get_page_dims(index: usize) -> Result<(u32, u32, bool), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let raw = read_page_bytes(index)?;
-        let reader = image::ImageReader::new(Cursor::new(&raw))
+        let reader = image::ImageReader::new(Cursor::new(&raw[..]))
             .with_guessed_format()
             .map_err(|e| e.to_string())?;
         let is_gif = matches!(reader.format(), Some(image::ImageFormat::Gif));
@@ -1045,9 +1045,12 @@ fn nested_temp_dir() -> Result<PathBuf, String> {
     Ok(d)
 }
 
-/// 入れ子関連の状態を破棄する（別のファイルを開く時に呼ぶ）。
+/// 別のファイルを開く時に、前のファイルに紐づくキャッシュ類を破棄する。
+/// 開く処理（open_archive / open_folder / テストの open_sync）から必ず呼ぶこと。
+/// ここで捨て損ねると、ページ番号が同じ「前のファイルの中身」を返してしまう。
 fn clear_nested_state() {
     INNER_CACHE.lock().unwrap().clear();
+    RECENT_PAGES.lock().unwrap().clear();
     let d = std::env::temp_dir()
         .join("MameViewer_nested")
         .join(std::process::id().to_string());
@@ -1195,6 +1198,13 @@ fn store_thumb_from_bytes(gen: u64, index: usize, raw: &[u8]) {
 /// STATUS_ENTRYPOINT_NOT_FOUND で異常終了する問題があったため、
 /// プレーンな戻り値のポーリング方式に変更している）。
 fn pregen_thumbnails(gen: u64) {
+    // 開いた直後は、最初のページの表示・先読みにCPUとディスクを譲る。
+    // ここで即座に全ページのサムネイル生成を始めると、大きなアーカイブでは
+    // 数千ページ分のデコードが一斉に走り、操作を受け付けないほど重くなる。
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    if THUMB_GEN.load(AtomicOrd::Relaxed) != gen {
+        return; // 待っている間に別のファイルへ切り替わった
+    }
     let (path, format, entries) = {
         let guard = ARCHIVE.lock().unwrap();
         let Some(st) = guard.as_ref() else { return };
@@ -1227,12 +1237,24 @@ fn pregen_thumbnails(gen: u64) {
                 let msg = rx.lock().unwrap().recv();
                 match msg {
                     Ok((idx, raw)) => {
+                        let started = std::time::Instant::now();
                         store_thumb_from_bytes(gen, idx, &raw);
                         if !canceled() {
                             let done = completed.fetch_add(1, AtomicOrd::Relaxed) + 1;
                             if THUMB_GEN.load(AtomicOrd::Relaxed) == gen {
                                 THUMB_DONE.store(done.min(total), AtomicOrd::Relaxed);
                             }
+                        }
+                        // サムネイル生成は裏方の仕事。1枚デコードするたびに同じくらい
+                        // 休んで、読書中のページ送り・先読みにCPUとディスクを譲る
+                        // （休まないと大きなアーカイブで数千枚を全力処理し続け、
+                        //   その間ずっと操作が重くなる）。上限は付けて、極端に重い
+                        //   1枚のせいで生成が止まったように見えないようにする。
+                        if !canceled() {
+                            let pause = started
+                                .elapsed()
+                                .min(std::time::Duration::from_millis(60));
+                            std::thread::sleep(pause);
                         }
                     }
                     Err(_) => break, // 送信側終了
@@ -1526,7 +1548,40 @@ async fn open_archive(path: String, reset: bool) -> Result<OpenResult, String> {
 }
 
 /// 指定ページの画像バイト列を読み出す（内部処理）。
-fn read_page_bytes(index: usize) -> Result<Vec<u8>, String> {
+/// 直近に読み出したページの生バイト列（世代番号, ページ番号, 中身）。
+/// 見開き表示では1ページにつき get_page_dims（寸法）と get_page（表示）の
+/// 2回読み出しが走り、アーカイブから同じエントリを二重に展開していた。
+/// ごく少数だけ保持して、この直後の重複展開を省く。
+static RECENT_PAGES: LazyLock<Mutex<Vec<(u64, usize, Arc<Vec<u8>>)>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+const RECENT_PAGES_CAP: usize = 4;
+
+/// 生バイト列を共有参照のまま返す。呼び出し側の多く（寸法取得・サムネ生成）は
+/// 中身を読むだけなので、ここでコピーせずに済ませる。
+fn read_page_bytes(index: usize) -> Result<Arc<Vec<u8>>, String> {
+    let gen = THUMB_GEN.load(AtomicOrd::Relaxed);
+    {
+        let cache = RECENT_PAGES.lock().unwrap();
+        if let Some((_, _, bytes)) = cache.iter().find(|(g, i, _)| *g == gen && *i == index) {
+            return Ok(Arc::clone(bytes));
+        }
+    }
+    let bytes = Arc::new(read_page_bytes_uncached(index)?);
+    {
+        let mut cache = RECENT_PAGES.lock().unwrap();
+        // 別のファイルへ切り替わっていたら、古い世代の分はまとめて捨てる。
+        cache.retain(|(g, _, _)| *g == gen);
+        if !cache.iter().any(|(g, i, _)| *g == gen && *i == index) {
+            cache.push((gen, index, Arc::clone(&bytes)));
+            while cache.len() > RECENT_PAGES_CAP {
+                cache.remove(0);
+            }
+        }
+    }
+    Ok(bytes)
+}
+
+fn read_page_bytes_uncached(index: usize) -> Result<Vec<u8>, String> {
     let (path, format, entry) = {
         let guard = ARCHIVE.lock().unwrap();
         let st = guard.as_ref().ok_or("アーカイブが開かれていません")?;
@@ -1638,7 +1693,10 @@ async fn get_page(index: usize) -> Result<tauri::ipc::Response, String> {
     let bytes = tauri::async_runtime::spawn_blocking(move || read_page_bytes(index))
         .await
         .map_err(|e| e.to_string())??;
-    Ok(tauri::ipc::Response::new(bytes))
+    // IPCへ渡す時だけ所有権のあるVecが要る。他の呼び出し側は共有参照のまま扱う。
+    Ok(tauri::ipc::Response::new(
+        Arc::try_unwrap(bytes).unwrap_or_else(|arc| (*arc).clone()),
+    ))
 }
 
 /// サムネイルJPEGを生成（生成済みならキャッシュから返す）。
@@ -1650,7 +1708,7 @@ fn make_thumbnail(index: usize) -> Result<Arc<Vec<u8>>, String> {
     // いた場合（挿入直前に世代不一致）はキャッシュへ書き込まない。
     let gen = THUMB_GEN.load(AtomicOrd::Relaxed);
     let raw = read_page_bytes(index)?;
-    let img = image::load_from_memory(&raw).map_err(|e| format!("画像デコード失敗: {e}"))?;
+    let img = image::load_from_memory(&raw[..]).map_err(|e| format!("画像デコード失敗: {e}"))?;
     let thumb = img.thumbnail(THUMB_MAX, THUMB_MAX);
     let rgb = thumb.to_rgb8();
     let mut out = Cursor::new(Vec::new());
@@ -1908,6 +1966,40 @@ mod tests {
 
         // 範囲外はエラー。
         assert!(read_page_bytes(10).is_err());
+    }
+
+    /// 回帰テスト：直近ページのバイト列キャッシュ（RECENT_PAGES）が、
+    /// 同じページの再読み出しでは同じ内容を返し、かつ別ファイルを開いたら
+    /// 破棄されること。破棄漏れがあると「ページ番号が同じ前のファイルの中身」
+    /// を表示してしまう。
+    #[test]
+    fn recent_page_cache_reuses_and_invalidates() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let zip = concat!(env!("CARGO_MANIFEST_DIR"), "/../test/test.zip");
+        open_sync(zip).expect("Zipを開けること");
+
+        // 1回目の読み出しでキャッシュに載り、2回目も同じ内容が返ること
+        // （見開き表示では寸法取得と表示で同じページを2回読むため、ここが効く）。
+        let first = read_page_bytes(0).expect("先頭ページ読み出し");
+        assert!(
+            RECENT_PAGES.lock().unwrap().iter().any(|(_, i, _)| *i == 0),
+            "読み出したページがキャッシュに載ること"
+        );
+        let second = read_page_bytes(0).expect("同じページの再読み出し");
+        assert_eq!(first, second, "キャッシュ経由でも同じ内容が返ること");
+
+        // 別ファイル（ここではフォルダ）を開いたらキャッシュが空になること。
+        let base = std::env::temp_dir().join("mameviewer_recent_cache_test");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("a.png"), b"other-file").unwrap();
+        clear_nested_state(); // 開く処理が必ず通る破棄フック
+        assert!(
+            RECENT_PAGES.lock().unwrap().is_empty(),
+            "ファイル切替時にキャッシュが破棄されること"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// 回帰テスト：ファイル切替時に、旧アーカイブから遅れて届いたサムネイル

@@ -295,10 +295,12 @@ function loadCacheLimitMb(): number {
   const v = Number(localStorage.getItem("cacheMb"));
   return v >= 64 ? v : 512; // 既定は「標準」512MB
 }
+// キャッシュ使用量の合計。pageBytes を毎回走査すると、破棄ループ（evict）が
+// O(n^2) になりページ送りのたびに無駄な計算が走るため、増減時に更新する
+// 実行時合計として保持する。
+let cacheBytesTotal = 0;
 function currentCacheBytes(): number {
-  let total = 0;
-  for (const b of pageBytes.values()) total += b;
-  return total;
+  return cacheBytesTotal;
 }
 
 // サムネイル一覧
@@ -394,7 +396,9 @@ function startProgressPolling() {
     } catch {
       stopProgressPolling();
     }
-  }, 200);
+    // 進捗表示のためだけのIPC往復なので、間隔は控えめでよい
+    // （200msだと毎秒5回。読み込みが重い最中に余計な負荷をかけてしまう）。
+  }, 500);
 }
 
 // ---- ページキャッシュ ----
@@ -427,6 +431,7 @@ function evict() {
     if (victim === undefined) break;
     URL.revokeObjectURL(pageCache.get(victim)!);
     pageCache.delete(victim);
+    cacheBytesTotal -= pageBytes.get(victim) ?? 0;
     pageBytes.delete(victim);
   }
   updateCacheUsageUi();
@@ -466,6 +471,7 @@ async function getPageUrl(index: number): Promise<string> {
   if (!pageCache.has(index)) {
     pageCache.set(index, url);
     pageBytes.set(index, size);
+    cacheBytesTotal += size;
     evict();
   }
   touch(index);
@@ -527,7 +533,7 @@ function targetBoxFor(natW: number, natH: number): { w: number; h: number } {
 }
 
 // 現在ページの前後を裏で先読み（原寸バイト列を先読みし、めくった瞬間に表示できるようにする）。
-function prefetch() {
+function runPrefetch() {
   const targets: number[] = [];
   for (let d = 1; d <= PRELOAD_AHEAD; d++) targets.push(current + d);
   for (let d = 1; d <= PRELOAD_BEHIND; d++) targets.push(current - d);
@@ -538,10 +544,20 @@ function prefetch() {
   }
 }
 
+// 先読みは「めくる手が止まってから」まとめて行う。ホイールを速く回すと
+// ページ送りのたびに最大4ページ分の読み込みが積み重なり、通り過ぎるだけの
+// ページのためにディスクI/Oとメモリを消費して、かえって重くなるため。
+let prefetchTimer: number | undefined;
+function prefetch() {
+  window.clearTimeout(prefetchTimer);
+  prefetchTimer = window.setTimeout(runPrefetch, 180);
+}
+
 function resetPageCache() {
   for (const url of pageCache.values()) URL.revokeObjectURL(url);
   pageCache.clear();
   pageBytes.clear();
+  cacheBytesTotal = 0;
   pageInflight.clear();
   pageDims.clear();
   updateCacheUsageUi();
@@ -570,13 +586,26 @@ function canPan(): boolean {
   return dispW > vw + 0.5 || dispH > vh + 0.5;
 }
 
+// 同じ値でもstyleへ代入するとブラウザがスタイル再計算を予約してしまうため、
+// 変化した時だけ書き込む（applyLayoutSettledが1回のページ送りで2回走る都合上、
+// 2回目はほぼ同値になる。無駄な再計算を省くと体感が軽くなる）。
+function setStyleIfChanged(el: HTMLElement, prop: "width" | "height" | "transform", value: string) {
+  if (el.style[prop] !== value) el.style[prop] = value;
+}
+
 // 回転＋パン位置を反映するだけの軽量処理（サイズ計算はしない、ドラッグ中に多用）。
 // 見開き時はパンをコンテナ（#spread）側で、回転は各画像側で扱う。
 function updateTransform() {
+  // translate3d を使うとGPU合成レイヤーに乗り、パン中の再描画がCPU側の
+  // ペイントを伴わなくなる（2D translate だと環境により毎回ペイントが走る）。
   if (spreadMode) {
-    spread.style.transform = `translate(${panX}px, ${panY}px)`;
+    setStyleIfChanged(spread, "transform", `translate3d(${panX}px, ${panY}px, 0)`);
   } else {
-    img.style.transform = `translate(${panX}px, ${panY}px) rotate(${rotation}deg)`;
+    setStyleIfChanged(
+      img,
+      "transform",
+      `translate3d(${panX}px, ${panY}px, 0) rotate(${rotation}deg)`
+    );
   }
 }
 
@@ -753,8 +782,8 @@ function applyLayoutSingle() {
   if (!natW || !natH) return;
   const swapped = rotation % 180 !== 0; // 90/270度では見た目上の縦横が入れ替わる
   const box = targetBoxFor(natW, natH); // 回転前の実ピクセルサイズ（= imgに指定するサイズ）
-  img.style.width = `${box.w}px`;
-  img.style.height = `${box.h}px`;
+  setStyleIfChanged(img, "width", `${box.w}px`);
+  setStyleIfChanged(img, "height", `${box.h}px`);
 
   // dispW/dispH はパン範囲計算用の「回転後(見た目)の表示サイズ」。
   dispW = swapped ? box.h : box.w;
@@ -818,9 +847,9 @@ function applyLayoutSpread() {
   const { left, right } = spreadBoxesFor(dLeft, dRight);
 
   const setImgBox = (el: HTMLImageElement, box: { w: number; h: number }) => {
-    el.style.width = `${box.w}px`;
-    el.style.height = `${box.h}px`;
-    el.style.transform = rotation ? `rotate(${rotation}deg)` : "";
+    setStyleIfChanged(el, "width", `${box.w}px`);
+    setStyleIfChanged(el, "height", `${box.h}px`);
+    setStyleIfChanged(el, "transform", rotation ? `rotate(${rotation}deg)` : "");
   };
   setImgBox(pageLeftEl, left);
   setImgBox(pageRightEl, right);
@@ -1297,6 +1326,7 @@ async function openArchive(path: string, reset = false) {
     currentAnchor = path;
     updateWindowTitle();
     if (shelfOpen) updateShelfAddBtnUi(); // 別の本を開いたら追加/削除の表示を切り替える
+    loadBookmarkedPages(); // この本のしおり位置をまとめて取得（以後はIPCなしで判定）
     setTreeRootForAnchor(path);
     hint.style.display = "none";
     seek.disabled = false;
@@ -1336,6 +1366,7 @@ async function openImageOrFolder(path: string, reset = false) {
     currentAnchor = res.dir;
     updateWindowTitle();
     if (shelfOpen) updateShelfAddBtnUi(); // 別の本を開いたら追加/削除の表示を切り替える
+    loadBookmarkedPages(); // この本のしおり位置をまとめて取得（以後はIPCなしで判定）
     setTreeRootForAnchor(res.dir);
     hint.style.display = "none";
     seek.disabled = false;
@@ -1458,6 +1489,7 @@ function toggleSettingsMenu(force?: boolean) {
     toggleDisplayMenu(false);
     const btn = document.querySelector<HTMLButtonElement>("#settings-menu-btn")!;
     positionMenuAboveButton(settingsMenu, btn);
+    updateCacheUsageUi(); // 隠れている間は更新を省いているので、開いた時に反映する
   }
 }
 
@@ -1712,6 +1744,9 @@ if (spreadMode) {
 
 // ---- キャッシュ設定（動作の軽快さ／メモリ使用量） ----
 function updateCacheUsageUi() {
+  // ページを読むたびに呼ばれるが、設定メニューを開いていなければ誰も見ていない。
+  // 隠れているDOMへの書き込みを省く（開いた時に必ず呼び直している）。
+  if (settingsMenu.classList.contains("hidden")) return;
   const usedMb = currentCacheBytes() / (1024 * 1024);
   const limitMb = cacheLimitBytes / (1024 * 1024);
   const pct = limitMb > 0 ? Math.min(100, (usedMb / limitMb) * 100) : 0;
@@ -1876,23 +1911,31 @@ const bmClearBrokenBtn = document.querySelector<HTMLButtonElement>("#bm-clear-br
 // （どこにしおりを挟んだかが一目で分かるように）。
 const bookmarkBtn = document.querySelector<HTMLButtonElement>("#bookmark-btn")!;
 
-async function updateBookmarkBtnUi() {
-  let marked = false;
-  if (currentAnchor && pageCount > 0) {
-    try {
-      const id = await invoke<number | null>("find_bookmark", {
-        anchor: currentAnchor,
-        page: current,
-      });
-      marked = id != null;
-    } catch {
-      marked = false;
-    }
+// 現在の本のしおりページ番号。ページ送りのたびにRust側へ問い合わせると
+// IPC往復がページ数分積み重なるため、本を開いた時に一度だけ取得して保持する。
+let bookmarkedPages = new Set<number>();
+let bookmarkedAnchor: string | null = null;
+
+async function loadBookmarkedPages() {
+  bookmarkedPages = new Set();
+  bookmarkedAnchor = currentAnchor;
+  if (!currentAnchor) return;
+  try {
+    const list = await invoke<BookmarkView[]>("list_bookmarks", { anchor: currentAnchor });
+    if (bookmarkedAnchor !== currentAnchor) return; // 取得中に別の本へ切り替わった
+    for (const b of list) bookmarkedPages.add(b.page);
+  } catch (e) {
+    console.error("しおり情報の取得に失敗:", e);
   }
+  updateBookmarkBtnUi();
+}
+
+function updateBookmarkBtnUi() {
+  const marked = currentAnchor !== null && pageCount > 0 && bookmarkedPages.has(current);
   bookmarkBtn.classList.toggle("marked", marked);
   bookmarkBtn.title = marked
-    ? "このページのしおりを外す (B)"
-    : "このページにしおりを挟む (B)";
+    ? "このページのしおりを外すのだ (B)"
+    : "このページにしおりを挟むのだ (B)";
 }
 
 async function toggleBookmark() {
@@ -1904,8 +1947,10 @@ async function toggleBookmark() {
     });
     if (existingId != null) {
       await invoke("remove_bookmark", { id: existingId });
+      bookmarkedPages.delete(current);
     } else {
       await invoke("add_bookmark", { anchor: currentAnchor, page: current });
+      bookmarkedPages.add(current);
     }
     if (bmOpen) await buildBookmarksList();
     updateBookmarkBtnUi();
@@ -2330,14 +2375,28 @@ window.addEventListener("blur", () => {
   viewer.style.cursor = canPan() ? "grab" : "";
 });
 
+// パン中の反映は描画フレームに合わせて間引く。ゲーミングマウス等では
+// mousemove が毎秒数百回発火し、そのたびDOMを更新すると描画が追いつかず
+// 引っかかって見えるため、1フレームにつき1回だけ反映する。
+let panFramePending = false;
+function schedulePanUpdate() {
+  if (panFramePending) return;
+  panFramePending = true;
+  requestAnimationFrame(() => {
+    panFramePending = false;
+    if (!panning) return;
+    updateTransform();
+    updateNavigatorViewportRect(); // ドラッグ中もミニマップの青枠を追従させる
+  });
+}
+
 // マウスを画面上端／下端に寄せたらバー表示／パン中は画像位置を更新
 window.addEventListener("mousemove", (e) => {
   if (panning) {
     const { maxX, maxY } = panLimits();
     panX = clampNum(panOrigX + (e.clientX - panStartX), -maxX, maxX);
     panY = clampNum(panOrigY + (e.clientY - panStartY), -maxY, maxY);
-    updateTransform();
-    updateNavigatorViewportRect(); // ドラッグ中もミニマップの青枠を追従させる
+    schedulePanUpdate();
     return;
   }
   if (gridOpen) return;
