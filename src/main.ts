@@ -433,6 +433,7 @@ function evict() {
     pageCache.delete(victim);
     cacheBytesTotal -= pageBytes.get(victim) ?? 0;
     pageBytes.delete(victim);
+    predecoded.delete(victim); // 元URLを破棄したので、デコード済みの保持も解く
   }
   updateCacheUsageUi();
 }
@@ -532,6 +533,34 @@ function targetBoxFor(natW: number, natH: number): { w: number; h: number } {
   return { w: Math.max(1, Math.round(preW)), h: Math.max(1, Math.round(preH)) };
 }
 
+// バイト列を先読みしただけでは、めくった瞬間にブラウザのデコード待ちが残る。
+// 高解像度の漫画ページではこのデコードが待ち時間の大半を占めるため、
+// 次に見る可能性が高いページはデコードまで済ませておく。
+// デコード済み画像はメモリを大きく使うので、保持するのは少数に限る。
+const predecoded = new Map<number, HTMLImageElement>();
+const PREDECODE_KEEP = 3;
+
+async function predecode(index: number) {
+  if (index < 0 || index >= pageCount || predecoded.has(index)) return;
+  const gen = archiveGen;
+  try {
+    const url = await getPageUrl(index);
+    if (gen !== archiveGen) return;
+    const im = new Image();
+    im.src = url;
+    await im.decode();
+    if (gen !== archiveGen || predecoded.has(index)) return;
+    predecoded.set(index, im);
+    while (predecoded.size > PREDECODE_KEEP) {
+      const oldest = predecoded.keys().next().value;
+      if (oldest === undefined) break;
+      predecoded.delete(oldest);
+    }
+  } catch {
+    // 先読みデコードの失敗は無視（実際に表示する時に改めて読み直す）
+  }
+}
+
 // 現在ページの前後を裏で先読み（原寸バイト列を先読みし、めくった瞬間に表示できるようにする）。
 function runPrefetch() {
   const targets: number[] = [];
@@ -540,6 +569,16 @@ function runPrefetch() {
   for (const t of targets) {
     if (t >= 0 && t < pageCount && !pageCache.has(t)) {
       getPageUrl(t).catch(() => {}); // 先読み失敗は無視
+    }
+  }
+  // 直後に見るページ（見開き時はその次の組）だけデコードまで先に済ませる。
+  const ahead = spreadMode ? 2 : 1;
+  predecode(current + ahead);
+  if (spreadMode) {
+    // 見開きは表示前にページ寸法（横長かどうかの判定）が必要で、
+    // これを待つ分だけめくりが遅れる。次の組の分を先に取っておく。
+    for (const t of [current + 2, current + 3]) {
+      if (t >= 0 && t < pageCount) getImageDims(t).catch(() => {});
     }
   }
 }
@@ -558,6 +597,7 @@ function resetPageCache() {
   pageCache.clear();
   pageBytes.clear();
   cacheBytesTotal = 0;
+  predecoded.clear();
   pageInflight.clear();
   pageDims.clear();
   updateCacheUsageUi();
@@ -1831,6 +1871,16 @@ function toggleGrid() {
   else openGrid();
 }
 
+// セルのクリックはここで一括して受ける（セルごとにリスナーを付けない）。
+gridScroll.addEventListener("click", (e) => {
+  const cell = (e.target as HTMLElement).closest<HTMLElement>(".cell");
+  if (!cell || !gridScroll.contains(cell)) return;
+  const idx = Number(cell.dataset.idx);
+  if (!Number.isFinite(idx)) return;
+  jump(idx);
+  closeGrid();
+});
+
 function buildGrid() {
   gridScroll.innerHTML = "";
   setThumbSize(Number(thumbSize.value));
@@ -1846,6 +1896,12 @@ function buildGrid() {
     },
     { root: gridScroll, rootMargin: "300px" }
   );
+  // 数千ページのアーカイブでは要素数が多いので、
+  //  ・DocumentFragment にまとめてから1回だけ挿入（都度挿入だとレイアウトが繰り返し走る）
+  //  ・クリックは1つの委譲ハンドラで受ける（ページ数分のリスナーを作らない）
+  // として、一覧を開いた瞬間に固まらないようにする。
+  const frag = document.createDocumentFragment();
+  const cells: HTMLElement[] = [];
   for (let i = 0; i < pageCount; i++) {
     const cell = document.createElement("div");
     cell.className = "cell loading" + (i === current ? " current" : "");
@@ -1854,13 +1910,11 @@ function buildGrid() {
     no.className = "no";
     no.textContent = String(i + 1);
     cell.appendChild(no);
-    cell.addEventListener("click", () => {
-      jump(i);
-      closeGrid();
-    });
-    gridScroll.appendChild(cell);
-    io.observe(cell);
+    frag.appendChild(cell);
+    cells.push(cell);
   }
+  gridScroll.appendChild(frag);
+  for (const cell of cells) io.observe(cell);
   // 現在ページを画面内へ
   requestAnimationFrame(() => {
     gridScroll
