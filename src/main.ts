@@ -2171,6 +2171,7 @@ function renderBookmarkCell(bm: BookmarkView): HTMLDivElement {
   delBtn.addEventListener("click", async () => {
     await invoke("remove_bookmark", { id: bm.id });
     buildBookmarksList();
+    loadBookmarkedPages(); // しおりボタンの点灯状態も同期させる
   });
   actions.appendChild(delBtn);
   cell.appendChild(actions);
@@ -2228,6 +2229,7 @@ bmClearBrokenBtn.addEventListener("click", async () => {
     if (!bm.exists) await invoke("remove_bookmark", { id: bm.id });
   }
   buildBookmarksList();
+  loadBookmarkedPages(); // しおりボタンの点灯状態も同期させる
 });
 
 // ---- 入力 ----
@@ -2438,7 +2440,8 @@ function schedulePanUpdate() {
   panFramePending = true;
   requestAnimationFrame(() => {
     panFramePending = false;
-    if (!panning) return;
+    // ドラッグが終わっていても反映は行う。ここで省くと、離す直前の移動分が
+    // 画面に出ないまま内部座標だけ進み、次の操作時に画像が僅かに飛ぶ。
     updateTransform();
     updateNavigatorViewportRect(); // ドラッグ中もミニマップの青枠を追従させる
   });
