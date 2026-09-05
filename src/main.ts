@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
 import { open as openDialog, ask } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -638,7 +639,11 @@ function setStyleIfChanged(el: HTMLElement, prop: "width" | "height" | "transfor
 function updateTransform() {
   // translate3d を使うとGPU合成レイヤーに乗り、パン中の再描画がCPU側の
   // ペイントを伴わなくなる（2D translate だと環境により毎回ペイントが走る）。
-  if (spreadMode) {
+  // 重要：applyLayout() と同じく、spreadMode（設定）ではなく実際の表示で分岐する。
+  // 見開き設定のままでも表紙・横長・GIF・単ページのファイルは単ページ表示に
+  // フォールバックしており、設定で分岐すると非表示の #spread 側へ位置を書き込み、
+  // 見えている画像が動かない（手のひらツールが効かないように見える）。
+  if (!spread.classList.contains("hidden")) {
     setStyleIfChanged(spread, "transform", `translate3d(${panX}px, ${panY}px, 0)`);
   } else {
     setStyleIfChanged(
@@ -783,6 +788,10 @@ window.addEventListener("mousemove", (e) => {
   if (navDragging) jumpNavigatorTo(e.clientX, e.clientY);
 });
 window.addEventListener("mouseup", () => {
+  // ミニマップ外まで引っ張って離すと、click はミニマップではなく画像側で
+  // 発生する（クリック対象は押した位置と離した位置の共通の親になるため）。
+  // onUi() では弾けないので、パン操作と同じくフラグで次のクリックを抑止する。
+  if (navDragging) justPanned = true;
   navDragging = false;
 });
 
@@ -1651,6 +1660,14 @@ document.querySelector("#keybind-close")?.addEventListener("click", closeKeybind
 let aboutOpen = false;
 const aboutEl = document.querySelector<HTMLDivElement>("#about")!;
 
+// 実際に動いているアプリのバージョン（tauri.conf.json の version）を表示する。
+getVersion()
+  .then((v) => {
+    document.querySelector<HTMLParagraphElement>("#about-version")!.textContent =
+      `バージョン ${v}`;
+  })
+  .catch((e) => console.error("バージョン取得に失敗:", e));
+
 function openAbout() {
   aboutOpen = true;
   aboutEl.classList.remove("hidden");
@@ -2269,7 +2286,7 @@ window.addEventListener(
 // UI領域（バー・メニュー・一覧・案内）上のクリックはページ送りに使わない
 function onUi(e: Event): boolean {
   return !!(e.target as HTMLElement).closest(
-    "#tree-panel, #shelf, #bar, #topbar, #menu, #display-menu, #settings-menu, #grid, #hint, #bookmarks, #resume-dialog, #help, #keybind, #about"
+    "#tree-panel, #shelf, #bar, #topbar, #menu, #display-menu, #settings-menu, #grid, #hint, #bookmarks, #resume-dialog, #help, #keybind, #about, #navigator-panel"
   );
 }
 
