@@ -51,6 +51,20 @@
         <img id="page-right" alt="" draggable="false" />
       </div>
 
+      <!-- 本文表示（txt / md）。画像と同じくページ送りで読む -->
+      <div id="textview" class="hidden"><div id="textview-body"></div></div>
+
+      <!-- 同梱テキスト：アーカイブ／フォルダに含まれる説明書き等を必要時に開く。
+           画像のページ列には混ぜないため、ここから選ぶ形にしている。 -->
+      <div id="texts" class="hidden">
+        <div class="grid-toolbar">
+          <span class="grid-title">同梱テキスト</span>
+          <button id="texts-close" title="閉じる (Esc)">✕</button>
+        </div>
+        <div id="texts-list"></div>
+        <div id="texts-reader" class="hidden"><div id="texts-reader-body"></div></div>
+      </div>
+
       <div id="hint">
         <p class="title">MameViewer</p>
         <p>Zip / Rar / 7z、画像ファイル、フォルダを開いてください</p>
@@ -205,6 +219,7 @@
         <button data-act="open">ファイルを開く</button>
         <button data-act="openFolder">フォルダを開く</button>
         <button data-act="grid">サムネイル一覧</button>
+        <button data-act="texts">同梱テキスト</button>
         <button data-act="first">先頭のページへ</button>
         <button data-act="last">最後のページへ</button>
         <div class="menu-sep"></div>

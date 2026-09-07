@@ -6,12 +6,17 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 
 const ARCHIVE_EXTS = ["zip", "cbz", "rar", "cbr", "7z", "cb7"];
 const IMAGE_EXTS = ["jpg", "jpeg", "png", "webp", "gif", "avif", "bmp"];
+const TEXT_EXTS = ["txt", "md"];
 function extOf(path: string): string {
   const dot = path.lastIndexOf(".");
   return dot >= 0 ? path.slice(dot + 1).toLowerCase() : "";
 }
 
 // ---- 状態 ----
+// ページの供給元。"archive"＝Rust側（アーカイブ・フォルダ・単独画像）、
+// "pdf"＝フロント側のpdf.jsが各ページを画像として描画する。
+// PDFもページ番号で扱う点は同じなので、見開き・拡大・しおり等は共通の仕組みに乗る。
+let pageSource: "archive" | "pdf" | "text" = "archive";
 let pageCount = 0;
 let current = 0;
 let barTimer: number | undefined;
@@ -72,8 +77,27 @@ function resetZoom() {
   zoomFactor = 1;
 }
 
+// 本文表示中の文字サイズ（rem）。拡大・縮小の操作をここへ割り当てる。
+let textFontRem = Number(localStorage.getItem("textFontRem")) || 1;
+const TEXT_FONT_MIN = 0.7;
+const TEXT_FONT_MAX = 2.4;
+
+function adjustTextFont(factor: number) {
+  const next = clampNum(textFontRem * factor, TEXT_FONT_MIN, TEXT_FONT_MAX);
+  if (next === textFontRem) return;
+  textFontRem = next;
+  localStorage.setItem("textFontRem", String(textFontRem));
+  textviewBody.style.setProperty("--text-size", `${textFontRem}rem`);
+  layoutTextPages(); // 文字サイズが変われば1ページに入る量も変わる
+}
+
 // マウスカーソル位置を基準にズームする（カーソルの指す場所がズーム後も同じ位置に留まる）。
 function zoomAt(clientX: number, clientY: number, factor: number) {
+  // 本文表示中は「拡大」＝文字を大きくする、と読み替える。
+  if (pageSource === "text") {
+    adjustTextFont(factor);
+    return;
+  }
   if (pageCount === 0) return;
   const oldZoom = zoomFactor;
   const newZoom = clampNum(oldZoom * factor, ZOOM_MIN, ZOOM_MAX);
@@ -402,6 +426,70 @@ function startProgressPolling() {
   }, 500);
 }
 
+// サムネイル1枚分のデータを取得する。PDFはRust側にページが無いので、
+// pdf.jsで描いたページ画像をそのままサムネイルとして使う。
+async function fetchThumbBlob(index: number): Promise<Blob> {
+  if (pageSource === "pdf") return await renderPdfPage(index);
+  const buf = await invoke<ArrayBuffer>("get_thumbnail", { index });
+  return new Blob([buf]);
+}
+
+// ---- PDF（pdf.jsで各ページを画像として描画し、画像と同じ扱いに乗せる） ----
+// ライブラリ本体は初回にPDFを開いた時だけ読み込む（起動を重くしないため）。
+type PdfDoc = {
+  numPages: number;
+  getPage: (n: number) => Promise<PdfPage>;
+};
+/// 破棄はドキュメントではなく読み込みタスク側が持つ（版によって場所が違うため保持しておく）。
+type PdfLoadingTask = { promise: Promise<unknown>; destroy: () => Promise<void> };
+let pdfLoadingTask: PdfLoadingTask | null = null;
+type PdfPage = {
+  getViewport: (o: { scale: number }) => { width: number; height: number };
+  render: (o: {
+    canvasContext: CanvasRenderingContext2D;
+    viewport: { width: number; height: number };
+  }) => { promise: Promise<void> };
+};
+
+let pdfDoc: PdfDoc | null = null;
+// 原寸の何倍で描画するか。1.0だと画面上で拡大した時に粗くなるため、少し余裕を持たせる。
+const PDF_RENDER_SCALE = 2.0;
+
+async function loadPdfLib() {
+  const lib = await import("pdfjs-dist");
+  // ワーカーはバンドル済みのものを使う（外部から取得しない）。
+  const workerUrl = (await import("pdfjs-dist/build/pdf.worker.min.mjs?url")).default;
+  lib.GlobalWorkerOptions.workerSrc = workerUrl;
+  return lib;
+}
+
+async function pdfPageDims(index: number): Promise<{ w: number; h: number; animated: boolean }> {
+  if (!pdfDoc) throw new Error("PDFが開かれていません");
+  const page = await pdfDoc.getPage(index + 1); // pdf.jsのページ番号は1始まり
+  const vp = page.getViewport({ scale: PDF_RENDER_SCALE });
+  return { w: Math.round(vp.width), h: Math.round(vp.height), animated: false };
+}
+
+async function renderPdfPage(index: number): Promise<Blob> {
+  if (!pdfDoc) throw new Error("PDFが開かれていません");
+  const page = await pdfDoc.getPage(index + 1);
+  const viewport = page.getViewport({ scale: PDF_RENDER_SCALE });
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(viewport.width));
+  canvas.height = Math.max(1, Math.round(viewport.height));
+  const ctx = canvas.getContext("2d")!;
+  await page.render({ canvasContext: ctx, viewport }).promise;
+  return await new Promise<Blob>((resolve, reject) => {
+    // 文字主体のPDFでも劣化しにくいようPNGではなく高品質JPEGにする
+    // （PNGだと写真ページで容量が跳ね上がり、キャッシュを圧迫するため）。
+    canvas.toBlob(
+      (b) => (b ? resolve(b) : reject(new Error("PDFページの画像化に失敗しました"))),
+      "image/jpeg",
+      0.92
+    );
+  });
+}
+
 // ---- ページキャッシュ ----
 // LRU：アクセスしたページを最新（末尾）へ。
 function touch(index: number) {
@@ -450,6 +538,10 @@ async function getPageUrl(index: number): Promise<string> {
   let p = pageInflight.get(index);
   if (!p) {
     const fetchP = (async () => {
+      if (pageSource === "pdf") {
+        const blob = await renderPdfPage(index);
+        return { url: URL.createObjectURL(blob), size: blob.size };
+      }
       const buf = await invoke<ArrayBuffer>("get_page", { index });
       return { url: URL.createObjectURL(new Blob([buf])), size: buf.byteLength };
     })();
@@ -490,6 +582,12 @@ async function getImageDims(
   const cached = pageDims.get(index);
   if (cached) return cached;
   const gen = archiveGen;
+  if (pageSource === "pdf") {
+    // PDFは実際に描画しなくても寸法が分かるので、ページ情報だけ引く。
+    const dims = await pdfPageDims(index);
+    if (gen === archiveGen) pageDims.set(index, dims);
+    return dims;
+  }
   const [w, h, animated] = await invoke<[number, number, boolean]>("get_page_dims", { index });
   const dims = { w, h, animated };
   if (gen === archiveGen) pageDims.set(index, dims); // 別アーカイブに切替済みなら汚さず破棄
@@ -720,8 +818,7 @@ async function updateNavigatorThumb() {
     const indices = isSpread ? [idxLeft, idxRight] : [current];
     const bitmaps = await Promise.all(
       indices.map(async (i) => {
-        const buf = await invoke<ArrayBuffer>("get_thumbnail", { index: i });
-        return createImageBitmap(new Blob([buf]));
+        return createImageBitmap(await fetchThumbBlob(i));
       })
     );
     if (key !== navThumbKey) return; // 取得中に表示内容が変わった
@@ -923,7 +1020,11 @@ function applyLayoutSettled() {
 // renderSingle() 内の decode() 後の処理と重複するうえ、こちらにはページ切替の
 // ガード（idx/gen チェック）が無く、素早いページ送り時に古い寸法で上書きして
 // 表示倍率がずれることがあったため削除した（renderSingle 側の処理のみで足りる）。
-window.addEventListener("resize", applyLayoutSettled);
+window.addEventListener("resize", () => {
+  // 本文は画面幅で段組みが変わる＝総ページ数も変わるため、組み直す。
+  if (pageSource === "text") layoutTextPages();
+  else applyLayoutSettled();
+});
 
 // ---- 表示 ----
 // 見開き時、実際に画面へ表示しているページ数（1 または 2）。
@@ -1044,7 +1145,258 @@ async function renderSpread() {
   }
 }
 
+// ---- 本文表示（txt / md） ----
+// 段組み（CSS columns）で1画面ぶんずつ区切り、横にずらして「めくる」。
+// 自前で文字数を数えて区切ると、見出し・箇条書き・長い行で破綻するため、
+// ブラウザの段組み機能に区切りを任せている。
+const textview = document.querySelector<HTMLDivElement>("#textview")!;
+const textviewBody = document.querySelector<HTMLDivElement>("#textview-body")!;
+const TEXT_COLUMN_GAP = 48;
+
+let textSource = ""; // 表示中の本文（再区切りのために保持）
+let textIsMarkdown = false;
+let textPageTotal = 1;
+
+/// HTMLとして解釈されうる文字を無効化する。本文は必ずこれを通してから組み立てる
+/// （テキスト内に書かれたタグを、そのままの文字として見せるため）。
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+/// 行内の装飾（太字・斜体・コード・リンク）を適用する。
+/// 入力は必ずエスケープ済みであること。リンクは http/https のみ許可する。
+function inlineMarkdown(s: string): string {
+  return s
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/\*([^*]+)\*/g, "<em>$1</em>")
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+}
+
+/// Markdownを整形済みHTMLへ変換する（見出し・箇条書き・引用・区切り線・コード）。
+function renderMarkdown(src: string): string {
+  const lines = escapeHtml(src).split(/\r?\n/);
+  const out: string[] = [];
+  let listType: "ul" | "ol" | null = null;
+  let inCode = false;
+  const closeList = () => {
+    if (listType) {
+      out.push(`</${listType}>`);
+      listType = null;
+    }
+  };
+  for (const line of lines) {
+    if (/^```/.test(line.trim())) {
+      closeList();
+      out.push(inCode ? "</pre>" : "<pre>");
+      inCode = !inCode;
+      continue;
+    }
+    if (inCode) {
+      out.push(line + "\n");
+      continue;
+    }
+    const heading = line.match(/^(#{1,3})\s+(.*)$/);
+    if (heading) {
+      closeList();
+      const level = heading[1].length;
+      out.push(`<h${level}>${inlineMarkdown(heading[2])}</h${level}>`);
+      continue;
+    }
+    if (/^(---|___|\*\*\*)\s*$/.test(line)) {
+      closeList();
+      out.push("<hr />");
+      continue;
+    }
+    const quote = line.match(/^&gt;\s?(.*)$/);
+    if (quote) {
+      closeList();
+      out.push(`<blockquote>${inlineMarkdown(quote[1])}</blockquote>`);
+      continue;
+    }
+    const ul = line.match(/^\s*[-*+]\s+(.*)$/);
+    const ol = line.match(/^\s*\d+\.\s+(.*)$/);
+    if (ul || ol) {
+      const want = ul ? "ul" : "ol";
+      if (listType !== want) {
+        closeList();
+        out.push(`<${want}>`);
+        listType = want;
+      }
+      out.push(`<li>${inlineMarkdown((ul ?? ol)![1])}</li>`);
+      continue;
+    }
+    if (line.trim() === "") {
+      closeList();
+      continue;
+    }
+    closeList();
+    out.push(`<p>${inlineMarkdown(line)}</p>`);
+  }
+  closeList();
+  if (inCode) out.push("</pre>");
+  return out.join("");
+}
+
+/// 素のテキストを段落として組む（空行を段落の区切りとみなす）。
+function renderPlainText(src: string): string {
+  return escapeHtml(src)
+    .split(/\r?\n\r?\n+/)
+    .map((block) => `<p>${block.replace(/\r?\n/g, "<br />")}</p>`)
+    .join("");
+}
+
+/// 本文を段組みし直して総ページ数を求める。画面サイズ・文字サイズの変更後に呼ぶ。
+function layoutTextPages() {
+  if (textview.classList.contains("hidden")) return;
+  const w = textviewBody.clientWidth;
+  if (w <= 0) return;
+  textviewBody.style.transform = "";
+  textviewBody.style.columnWidth = `${w}px`;
+  textviewBody.style.columnGap = `${TEXT_COLUMN_GAP}px`;
+  textviewBody.style.columnFill = "auto";
+  const stride = w + TEXT_COLUMN_GAP;
+  textPageTotal = Math.max(1, Math.round(textviewBody.scrollWidth / stride));
+  pageCount = textPageTotal;
+  seek.max = String(pageCount - 1);
+  if (current > pageCount - 1) current = pageCount - 1;
+  showTextPage(current);
+}
+
+function showTextPage(index: number) {
+  const stride = textviewBody.clientWidth + TEXT_COLUMN_GAP;
+  textviewBody.style.transform = `translateX(-${index * stride}px)`;
+  counter.textContent = `${index + 1} / ${pageCount}`;
+  seek.value = String(index);
+  updateBookmarkBtnUi();
+}
+
+/// 本文を組み直す（ファイルを開いた時・画面や文字サイズが変わった時だけ）。
+function buildTextView() {
+  textviewBody.style.setProperty("--text-size", `${textFontRem}rem`); // 前回の文字サイズを反映
+  // 画像側の表示要素は隠し、本文だけを見せる。
+  img.classList.remove("loaded");
+  spread.classList.add("hidden");
+  textview.classList.remove("hidden");
+  textviewBody.innerHTML = textIsMarkdown
+    ? renderMarkdown(textSource)
+    : renderPlainText(textSource);
+  // 段組みは実際の描画幅が要るため、レイアウト確定後に計算する。
+  layoutTextPages();
+  requestAnimationFrame(layoutTextPages);
+  flashBar();
+}
+
+/// 単体のテキストファイルを開く（画像と同じく、ページ送りで読む）。
+async function openTextFile(path: string, reset = false) {
+  stopProgressPolling();
+  resumeDialog.classList.add("hidden");
+  try {
+    textSource = await invoke<string>("read_text_file", { path });
+    textIsMarkdown = extOf(path) === "md";
+    pageSource = "text";
+    archiveGen++;
+    resetPageCache();
+    current = 0;
+    pageCount = 1; // 実際の総数は段組み後に確定する
+    currentAnchor = path;
+    updateWindowTitle();
+    if (shelfOpen) updateShelfAddBtnUi();
+    loadBookmarkedPages();
+    setTreeRootForAnchor(path);
+    hint.style.display = "none";
+    seek.disabled = false;
+    if (gridOpen) closeGrid();
+    buildTextView();
+    if (!reset) {
+      const h = await invoke<{ positions: Record<string, number> }>("get_history");
+      const saved = Math.min(h.positions[path] ?? 0, Math.max(0, pageCount - 1));
+      if (saved > 0) {
+        current = saved;
+        showTextPage(current);
+      }
+    }
+  } catch (e) {
+    alert("開けませんでした: " + e);
+  }
+}
+
+/// 画像以外の表示要素を片付ける（画像・PDFの表示へ戻る時に呼ぶ）。
+function hideTextView() {
+  textview.classList.add("hidden");
+}
+
+// ---- 同梱テキスト（アーカイブ／フォルダに含まれる説明書き等） ----
+// 画像のページ列には混ぜず、必要な時だけここから開く（読書の流れを乱さないため）。
+const textsPanel = document.querySelector<HTMLDivElement>("#texts")!;
+const textsList = document.querySelector<HTMLDivElement>("#texts-list")!;
+const textsReader = document.querySelector<HTMLDivElement>("#texts-reader")!;
+let textsOpen = false;
+
+async function openTextsPanel() {
+  textsOpen = true;
+  textsPanel.classList.remove("hidden");
+  textsReader.classList.add("hidden");
+  textsList.classList.remove("hidden");
+  textsList.innerHTML = "";
+  try {
+    const names = await invoke<string[]>("list_archive_texts");
+    if (names.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "texts-empty";
+      empty.textContent = "このファイルにテキストは含まれていません。";
+      textsList.appendChild(empty);
+      return;
+    }
+    for (const name of names) {
+      const btn = document.createElement("button");
+      btn.textContent = name;
+      btn.addEventListener("click", () => showArchiveText(name));
+      textsList.appendChild(btn);
+    }
+  } catch (e) {
+    console.error("同梱テキストの一覧取得に失敗:", e);
+  }
+}
+
+async function showArchiveText(name: string) {
+  try {
+    const body = await invoke<string>("read_archive_text", { name });
+    textsReader.innerHTML = name.toLowerCase().endsWith(".md")
+      ? renderMarkdown(body)
+      : renderPlainText(body);
+    textsList.classList.add("hidden");
+    textsReader.classList.remove("hidden");
+    textsReader.scrollTop = 0;
+  } catch (e) {
+    alert("テキストを開けませんでした: " + e);
+  }
+}
+
+function closeTextsPanel() {
+  // 本文を見ている時は一覧へ戻り、一覧まで戻っていればパネルを閉じる。
+  if (!textsReader.classList.contains("hidden")) {
+    textsReader.classList.add("hidden");
+    textsList.classList.remove("hidden");
+    return;
+  }
+  textsOpen = false;
+  textsPanel.classList.add("hidden");
+}
+
+document.querySelector("#texts-close")?.addEventListener("click", closeTextsPanel);
+
 async function render() {
+  if (pageSource === "text") {
+    // 本文は既に組んであるので、表示位置をずらすだけ（組み直しはしない）。
+    showTextPage(current);
+    return;
+  }
+  hideTextView();
   if (pageCount === 0) return;
   if (spreadMode) await renderSpread();
   else await renderSingle();
@@ -1070,7 +1422,7 @@ function go(delta: number) {
 // 見開き時は「今実際に表示している枚数(shownCount)」の分だけ current を動かす。
 function turnPage(dir: 1 | -1) {
   if (pageCount === 0) return;
-  if (!spreadMode) {
+  if (!spreadMode || pageSource === "text") {
     go(dir);
     return;
   }
@@ -1146,7 +1498,7 @@ interface TreeEntry {
   name: string;
   path: string;
   isDir: boolean;
-  kind: "folder" | "archive" | "image" | "other";
+  kind: "folder" | "archive" | "image" | "pdf" | "text" | "other";
   mtime: number; // 更新日時（UNIXエポック秒）
   size: number; // バイト数（フォルダは0）
 }
@@ -1242,7 +1594,13 @@ function buildTreeLevel(entries: TreeEntry[]): HTMLElement {
     row.append(toggle, icon, name);
     row.addEventListener("click", () => {
       if (entry.isDir) toggleTreeNode(entry.path);
-      else if (entry.kind === "archive" || entry.kind === "image") openPath(entry.path);
+      else if (
+        entry.kind === "archive" ||
+        entry.kind === "image" ||
+        entry.kind === "pdf" ||
+        entry.kind === "text"
+      )
+        openPath(entry.path);
     });
     node.appendChild(row);
 
@@ -1369,6 +1727,7 @@ async function openArchive(path: string, reset = false) {
       reset,
     });
     archiveGen++;
+    pageSource = "archive";
     resetPageCache();
     pageCount = res.count;
     current = res.initialIndex;
@@ -1409,6 +1768,7 @@ async function openImageOrFolder(path: string, reset = false) {
       { path, recursive, reset }
     );
     archiveGen++;
+    pageSource = "archive";
     resetPageCache();
     pageCount = res.count;
     current = res.initialIndex;
@@ -1428,11 +1788,55 @@ async function openImageOrFolder(path: string, reset = false) {
   }
 }
 
-// 拡張子からアーカイブ／画像・フォルダのどちらの開き方をすべきか振り分ける。
+// ---- PDFを開く ----
+// ページの中身はpdf.jsが供給するが、ページ番号・履歴・しおりは画像と同じ仕組みに乗せる。
+async function openPdf(path: string, reset = false) {
+  stopProgressPolling();
+  resumeDialog.classList.add("hidden");
+  try {
+    const lib = await loadPdfLib();
+    const buf = await invoke<ArrayBuffer>("read_file_bytes", { path });
+    const task = lib.getDocument({ data: new Uint8Array(buf) }) as unknown as PdfLoadingTask;
+    const doc = (await task.promise) as PdfDoc;
+    // 前のPDFの読み込みタスクを片付けてから差し替える（ワーカーを残さないため）。
+    if (pdfLoadingTask) await pdfLoadingTask.destroy().catch(() => {});
+    pdfLoadingTask = task;
+    pdfDoc = doc;
+    pageSource = "pdf";
+    archiveGen++;
+    resetPageCache();
+    pageCount = doc.numPages;
+    // 読書位置の記憶はRust側の履歴をそのまま使う（アンカーはPDFのパス）。
+    let initial = 0;
+    if (!reset) {
+      const h = await invoke<{ positions: Record<string, number> }>("get_history");
+      initial = Math.min(h.positions[path] ?? 0, Math.max(0, pageCount - 1));
+    }
+    current = initial;
+    currentAnchor = path;
+    updateWindowTitle();
+    if (shelfOpen) updateShelfAddBtnUi();
+    loadBookmarkedPages();
+    setTreeRootForAnchor(path);
+    hint.style.display = "none";
+    seek.disabled = false;
+    seek.max = String(pageCount - 1);
+    if (gridOpen) closeGrid();
+    await render();
+  } catch (e) {
+    alert("開けませんでした: " + e);
+  }
+}
+
+// 拡張子からアーカイブ／PDF／テキスト／画像・フォルダのどの開き方をすべきか振り分ける。
 async function openPath(path: string) {
   const ext = extOf(path);
   if (ARCHIVE_EXTS.includes(ext)) {
     await openArchive(path);
+  } else if (ext === "pdf") {
+    await openPdf(path);
+  } else if (TEXT_EXTS.includes(ext)) {
+    await openTextFile(path);
   } else {
     await openImageOrFolder(path);
   }
@@ -1474,8 +1878,8 @@ async function pickFile() {
     multiple: false,
     filters: [
       {
-        name: "アーカイブ・画像",
-        extensions: [...ARCHIVE_EXTS, ...IMAGE_EXTS],
+        name: "アーカイブ・画像・PDF・テキスト",
+        extensions: [...ARCHIVE_EXTS, ...IMAGE_EXTS, "pdf", ...TEXT_EXTS],
       },
     ],
   });
@@ -1568,6 +1972,7 @@ menu.addEventListener("click", (e) => {
   if (act === "open") pickFile();
   else if (act === "openFolder") pickFolder();
   else if (act === "grid") openGrid();
+  else if (act === "texts") openTextsPanel();
   else if (act === "first") jump(0);
   else if (act === "last") jump(pageCount - 1);
   else if (act === "bookmarkToggle") toggleBookmark();
@@ -1945,9 +2350,9 @@ async function loadThumb(cell: HTMLElement, idx: number) {
   await acquire();
   try {
     if (gen !== gridGen) return; // 一覧が閉じられた／切り替わった
-    const buf = await invoke<ArrayBuffer>("get_thumbnail", { index: idx });
+    const blob = await fetchThumbBlob(idx);
     if (gen !== gridGen) return;
-    const url = URL.createObjectURL(new Blob([buf]));
+    const url = URL.createObjectURL(blob);
     thumbUrls.push(url);
     const el = document.createElement("img");
     el.src = url;
@@ -2286,7 +2691,7 @@ window.addEventListener(
 // UI領域（バー・メニュー・一覧・案内）上のクリックはページ送りに使わない
 function onUi(e: Event): boolean {
   return !!(e.target as HTMLElement).closest(
-    "#tree-panel, #shelf, #bar, #topbar, #menu, #display-menu, #settings-menu, #grid, #hint, #bookmarks, #resume-dialog, #help, #keybind, #about, #navigator-panel"
+    "#tree-panel, #shelf, #bar, #topbar, #menu, #display-menu, #settings-menu, #grid, #hint, #bookmarks, #resume-dialog, #help, #keybind, #about, #navigator-panel, #texts"
   );
 }
 
@@ -2353,7 +2758,7 @@ window.addEventListener("click", (e) => {
     justPanned = false; // パン直後のクリックはページめくりに使わない
     return;
   }
-  if (gridOpen || bmOpen || helpOpen || keybindOpen || aboutOpen || onUi(e)) return;
+  if (gridOpen || bmOpen || helpOpen || keybindOpen || aboutOpen || textsOpen || onUi(e)) return;
   if (!menu.classList.contains("hidden")) {
     toggleMenu(false); // メニュー表示中の画面クリックは閉じるだけ
     return;
@@ -2370,7 +2775,7 @@ window.addEventListener("click", (e) => {
 });
 window.addEventListener("contextmenu", (e) => {
   e.preventDefault();
-  if (gridOpen || bmOpen || helpOpen || keybindOpen || aboutOpen || onUi(e)) return;
+  if (gridOpen || bmOpen || helpOpen || keybindOpen || aboutOpen || textsOpen || onUi(e)) return;
   turnPage(-1);
 });
 
@@ -2400,6 +2805,10 @@ window.addEventListener("keydown", (e) => {
   }
   if (aboutOpen) {
     if (e.key === "Escape") closeAbout();
+    return;
+  }
+  if (textsOpen) {
+    if (e.key === "Escape") closeTextsPanel();
     return;
   }
   // 説明書・サムネイル一覧・しおり一覧は、他のパネルが開いていても常に開閉できる。

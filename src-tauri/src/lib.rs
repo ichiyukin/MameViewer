@@ -621,6 +621,17 @@ fn is_image(name: &str) -> bool {
         .any(|e| l.ends_with(e))
 }
 
+/// PDFか判定（ページはフロント側のpdf.jsで画像として描画する）。
+fn is_pdf(name: &str) -> bool {
+    name.to_ascii_lowercase().ends_with(".pdf")
+}
+
+/// 本文として読めるテキストか判定。
+fn is_text(name: &str) -> bool {
+    let l = name.to_ascii_lowercase();
+    [".txt", ".md"].iter().any(|e| l.ends_with(e))
+}
+
 /// 拡張子からアーカイブ形式を判定。
 fn detect_format(path: &str) -> Result<Format, String> {
     let l = path.to_ascii_lowercase();
@@ -830,6 +841,10 @@ fn entry_kind(name: &str, is_dir: bool) -> String {
         "archive".to_string()
     } else if is_image(name) {
         "image".to_string()
+    } else if is_pdf(name) {
+        "pdf".to_string()
+    } else if is_text(name) {
+        "text".to_string()
     } else {
         "other".to_string()
     }
@@ -1699,6 +1714,105 @@ async fn get_page(index: usize) -> Result<tauri::ipc::Response, String> {
     ))
 }
 
+/// テキストの生バイト列を文字列へ復号する。
+/// 日本語のテキストはUTF-8とShift-JISが混在しており、決め打ちで復号すると
+/// 古いファイルが文字化けするため、内容から符号化方式を推定してから復号する。
+fn decode_text(raw: &[u8]) -> String {
+    // BOM付きならそれが最も確実な手掛かりになるので優先する。
+    if let Some(stripped) = raw.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        return String::from_utf8_lossy(stripped).into_owned();
+    }
+    let mut detector = chardetng::EncodingDetector::new();
+    detector.feed(raw, true);
+    let encoding = detector.guess(None, true);
+    let (text, _, _) = encoding.decode(raw);
+    text.into_owned()
+}
+
+/// 現在開いているアーカイブに同梱されているテキストの名前一覧を返す。
+/// テキストはページ列（画像）には混ぜず、必要な時だけここから開く。
+#[tauri::command]
+async fn list_archive_texts() -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (path, format) = {
+            let guard = ARCHIVE.lock().unwrap();
+            let Some(st) = guard.as_ref() else {
+                return Ok(Vec::new()); // 何も開いていない
+            };
+            (st.path.clone(), st.format)
+        };
+        if format == Format::Folder {
+            // フォルダを開いている場合は、その直下のテキストを対象にする。
+            let mut names: Vec<String> = std::fs::read_dir(&path)
+                .map_err(|e| e.to_string())?
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_file())
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|n| is_text(n))
+                .collect();
+            names.sort_by(|a, b| natural_cmp(a, b));
+            return Ok(names);
+        }
+        let path_str = path.to_string_lossy().to_string();
+        let mut names: Vec<String> = match format {
+            Format::Zip => list_zip(&path_str)?,
+            Format::Rar => list_rar(&path_str)?,
+            Format::SevenZ => list_7z(&path_str)?,
+            Format::Folder => unreachable!("上で処理済み"),
+        }
+        .into_iter()
+        .filter(|n| is_text(n))
+        .collect();
+        names.sort_by(|a, b| natural_cmp(a, b));
+        Ok(names)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 現在開いているアーカイブ内の、指定した名前のテキストを復号して返す。
+#[tauri::command]
+async fn read_archive_text(name: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (path, format) = {
+            let guard = ARCHIVE.lock().unwrap();
+            let st = guard.as_ref().ok_or("アーカイブが開かれていません")?;
+            (st.path.clone(), st.format)
+        };
+        let raw = if format == Format::Folder {
+            std::fs::read(Path::new(&path).join(&name)).map_err(|e| e.to_string())?
+        } else {
+            read_entry_from(&path, format, &name)?
+        };
+        Ok(decode_text(&raw))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 指定パスのテキストファイルを読み、文字コードを判別して本文を返す。
+#[tauri::command]
+async fn read_text_file(path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let raw = std::fs::read(&path).map_err(|e| format!("ファイルを読めません: {e}"))?;
+        Ok(decode_text(&raw))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 指定パスのファイルをそのまま読み出す（PDFをフロント側のpdf.jsへ渡すために使う）。
+/// アーカイブの状態とは無関係に、単体ファイルとして直接読む。
+#[tauri::command]
+async fn read_file_bytes(path: String) -> Result<tauri::ipc::Response, String> {
+    let bytes = tauri::async_runtime::spawn_blocking(move || {
+        std::fs::read(&path).map_err(|e| format!("ファイルを読めません: {e}"))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
 /// サムネイルJPEGを生成（生成済みならキャッシュから返す）。
 fn make_thumbnail(index: usize) -> Result<Arc<Vec<u8>>, String> {
     if let Some(b) = THUMBS.lock().unwrap().get(&index).cloned() {
@@ -1748,6 +1862,9 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        // 終了時のウィンドウサイズ・位置・最大化状態を保存し、次回起動時に復元する
+        // （ウィンドウを表示する前に復元されるため、既定サイズで一瞬開くちらつきが出ない）。
+        .plugin(tauri_plugin_window_state::Builder::default().build())
         .invoke_handler(tauri::generate_handler![
             open_archive,
             has_subfolders,
@@ -1773,7 +1890,11 @@ pub fn run() {
             add_to_shelf,
             remove_from_shelf,
             list_shelf,
-            is_in_shelf
+            is_in_shelf,
+            read_file_bytes,
+            read_text_file,
+            list_archive_texts,
+            read_archive_text
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
