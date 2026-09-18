@@ -1241,6 +1241,30 @@ fn pregen_thumbnails(gen: u64) {
         .map(|n| n.get().saturating_sub(1).clamp(1, 2))
         .unwrap_or(1);
 
+    // 受け渡し箱が満杯の時、そのまま送信を待つと中止の合図を見に行けなくなる。
+    // 別のファイルへ切り替えると消費者は即座に抜けるため、箱を空ける者がいなくなり、
+    // 生産者が永久に待ち続けてスレッドを1本占有したまま戻らなくなる（切り替えを
+    // 繰り返すとこの枠が枯渇し、ページ読み出しまで順番待ちになって極端に遅くなる）。
+    // そのため、待たずに試し、詰まっていれば少し休んで中止を確認する方式にする。
+    let send_cancellable = |tx: &mpsc::SyncSender<(usize, Vec<u8>)>,
+                            msg: (usize, Vec<u8>)|
+     -> bool {
+        let mut msg = msg;
+        loop {
+            if canceled() {
+                return false;
+            }
+            match tx.try_send(msg) {
+                Ok(()) => return true,
+                Err(mpsc::TrySendError::Full(m)) => {
+                    msg = m;
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => return false,
+            }
+        }
+    };
+
     std::thread::scope(|s| {
         for _ in 0..workers {
             let rx = Arc::clone(&rx);
@@ -1296,7 +1320,7 @@ fn pregen_thumbnails(gen: u64) {
                             if let Ok(mut e) = zip.by_name(&entry.name) {
                                 let mut buf = Vec::with_capacity(e.size() as usize);
                                 if e.read_to_end(&mut buf).is_ok()
-                                    && tx.send((idx, buf)).is_err()
+                                    && !send_cancellable(&tx, (idx, buf))
                                 {
                                     break;
                                 }
@@ -1327,7 +1351,7 @@ fn pregen_thumbnails(gen: u64) {
                                 if let Some(idx) = target {
                                     match header.read() {
                                         Ok((data, rest)) => {
-                                            let _ = tx.send((idx, data));
+                                            if !send_cancellable(&tx, (idx, data)) { break; }
                                             cursor = rest;
                                         }
                                         Err(_) => break,
@@ -1362,7 +1386,7 @@ fn pregen_thumbnails(gen: u64) {
                             if !THUMBS.lock().unwrap().contains_key(&idx) {
                                 let mut buf = Vec::new();
                                 reader.read_to_end(&mut buf)?;
-                                let _ = tx.send((idx, buf));
+                                if !send_cancellable(&tx, (idx, buf)) { return Ok(false); }
                             }
                         }
                         Ok(true)
@@ -1378,7 +1402,7 @@ fn pregen_thumbnails(gen: u64) {
                         continue;
                     }
                     if let Ok(buf) = std::fs::read(&entry.name) {
-                        if tx.send((idx, buf)).is_err() {
+                        if !send_cancellable(&tx, (idx, buf)) {
                             break;
                         }
                     }
@@ -1427,7 +1451,7 @@ fn pregen_thumbnails(gen: u64) {
                                 if let Some(&idx) = index_of.get(name.as_str()) {
                                     match header.read() {
                                         Ok((data, rest)) => {
-                                            let _ = tx.send((idx, data));
+                                            if !send_cancellable(&tx, (idx, data)) { break; }
                                             cursor = rest;
                                         }
                                         Err(_) => break,
@@ -1454,7 +1478,7 @@ fn pregen_thumbnails(gen: u64) {
                                 if let Ok(mut e) = zip.by_name(name) {
                                     let mut buf = Vec::with_capacity(e.size() as usize);
                                     if e.read_to_end(&mut buf).is_ok()
-                                        && tx.send((*idx, buf)).is_err()
+                                        && !send_cancellable(&tx, (*idx, buf))
                                     {
                                         break;
                                     }
@@ -1477,7 +1501,7 @@ fn pregen_thumbnails(gen: u64) {
                                 if let Some(&idx) = index_of.get(entry.name()) {
                                     let mut buf = Vec::new();
                                     reader.read_to_end(&mut buf)?;
-                                    let _ = tx.send((idx, buf));
+                                    if !send_cancellable(&tx, (idx, buf)) { return Ok(false); }
                                 }
                                 Ok(true)
                             });
