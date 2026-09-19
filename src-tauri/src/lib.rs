@@ -880,12 +880,15 @@ fn list_zip(path: &str) -> Result<Vec<String>, String> {
     let file = File::open(path).map_err(|e| format!("ファイルを開けません: {e}"))?;
     let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("Zipを読めません: {e}"))?;
     let mut entries = Vec::new();
+    prog_begin(PROG_ITEMS, zip.len() as u64);
     for i in 0..zip.len() {
+        prog_add(1);
         let f = zip.by_index(i).map_err(|e| e.to_string())?;
         if f.is_file() {
             entries.push(f.name().to_string());
         }
     }
+    prog_end();
     Ok(entries)
 }
 
@@ -894,12 +897,16 @@ fn list_rar(path: &str) -> Result<Vec<String>, String> {
         .open_for_listing()
         .map_err(|e| format!("Rarを読めません: {e}"))?;
     let mut entries = Vec::new();
+    // 総数は最後まで辿らないと分からないので、件数だけを出す。
+    prog_begin(PROG_ITEMS, 0);
     for entry in archive {
         let e = entry.map_err(|e| e.to_string())?;
+        prog_add(1);
         if e.is_file() {
             entries.push(e.filename.to_string_lossy().to_string());
         }
     }
+    prog_end();
     Ok(entries)
 }
 
@@ -907,11 +914,14 @@ fn list_7z(path: &str) -> Result<Vec<String>, String> {
     let sz = sevenz_rust::SevenZReader::open(path, sevenz_rust::Password::empty())
         .map_err(|e| format!("7zを読めません: {e}"))?;
     let mut entries = Vec::new();
+    prog_begin(PROG_ITEMS, sz.archive().files.len() as u64);
     for entry in &sz.archive().files {
+        prog_add(1);
         if !entry.is_directory() {
             entries.push(entry.name().to_string());
         }
     }
+    prog_end();
     Ok(entries)
 }
 
@@ -1107,6 +1117,21 @@ async fn list_places() -> Result<Vec<PlaceEntry>, String> {
     .map_err(|e| e.to_string())?
 }
 
+/// ファイルの総容量（バイト）。開く前に「どれくらい大きいファイルか」を
+/// 見せるために使う。フォルダや取得できない場合は0。
+#[tauri::command]
+async fn get_file_size(path: String) -> u64 {
+    tauri::async_runtime::spawn_blocking(move || {
+        std::fs::metadata(&path)
+            .ok()
+            .filter(|m| m.is_file())
+            .map(|m| m.len())
+            .unwrap_or(0)
+    })
+    .await
+    .unwrap_or(0)
+}
+
 /// 指定パスが開けるフォルダかを確かめる（パス直接入力の検証用）。
 #[tauri::command]
 async fn dir_exists(path: String) -> bool {
@@ -1269,49 +1294,167 @@ async fn list_volumes(anchor: String) -> Result<Vec<String>, String> {
 
 // ---- 形式別：1エントリ読み出し ----
 
+/// 読み出し中のページの進捗（読めた量／全体量）。
+/// ネットワーク上のファイルは1枚に数秒〜数十秒かかることがあり、
+/// 「どのあたりまで来たか」が見えないと止まったように感じられるため、
+/// 実際に読めたバイト数を数えてフロントへ見せる。
+static READ_DONE: AtomicU64 = AtomicU64::new(0);
+static READ_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// 0=計測なし / 1=バイト / 2=件数。形式によって数えられるものが違うため単位を持つ。
+static READ_UNIT: AtomicU64 = AtomicU64::new(0);
+pub const PROG_BYTES: u64 = 1;
+pub const PROG_ITEMS: u64 = 2;
+
+/// 計測を始める。total=0 は「総量が事前に分からない」＝実数だけ出す、の意味。
+fn prog_begin(unit: u64, total: u64) {
+    READ_DONE.store(0, AtomicOrd::Relaxed);
+    READ_TOTAL.store(total, AtomicOrd::Relaxed);
+    READ_UNIT.store(unit, AtomicOrd::Relaxed);
+}
+
+fn prog_add(n: u64) {
+    READ_DONE.fetch_add(n, AtomicOrd::Relaxed);
+}
+
+fn prog_end() {
+    READ_UNIT.store(0, AtomicOrd::Relaxed);
+    READ_TOTAL.store(0, AtomicOrd::Relaxed);
+    READ_DONE.store(0, AtomicOrd::Relaxed);
+}
+
+/// 大きな段取りの進み具合（例：内部アーカイブ 3/10 個目）。
+/// 細かい進捗（READ_*）は1個ごとに始め直されて上書きされるため、
+/// 「全体で今どのあたりか」を保つ枠を別に持つ。
+static STEP_DONE: AtomicU64 = AtomicU64::new(0);
+static STEP_TOTAL: AtomicU64 = AtomicU64::new(0);
+static STEP_LABEL: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new()));
+
+fn step_begin(label: &str, total: u64) {
+    *STEP_LABEL.lock().unwrap() = label.to_string();
+    STEP_TOTAL.store(total, AtomicOrd::Relaxed);
+    STEP_DONE.store(0, AtomicOrd::Relaxed);
+}
+
+fn step_set(done: u64) {
+    STEP_DONE.store(done, AtomicOrd::Relaxed);
+}
+
+fn step_end() {
+    STEP_LABEL.lock().unwrap().clear();
+    STEP_TOTAL.store(0, AtomicOrd::Relaxed);
+    STEP_DONE.store(0, AtomicOrd::Relaxed);
+}
+
+#[derive(serde::Serialize)]
+struct ReadProgress {
+    done: u64,
+    total: u64,
+    /// "bytes" | "items" | ""（空＝計測していない）
+    unit: String,
+    /// 大きな段取りの見出し（空＝段取りの表示なし）。
+    #[serde(rename = "stepLabel")]
+    step_label: String,
+    #[serde(rename = "stepDone")]
+    step_done: u64,
+    #[serde(rename = "stepTotal")]
+    step_total: u64,
+}
+
+/// 現在の読み出し進捗。フロントはこれを定期的に取得して表示する。
+#[tauri::command]
+fn get_read_progress() -> ReadProgress {
+    let unit = match READ_UNIT.load(AtomicOrd::Relaxed) {
+        PROG_BYTES => "bytes",
+        PROG_ITEMS => "items",
+        _ => "",
+    };
+    ReadProgress {
+        done: READ_DONE.load(AtomicOrd::Relaxed),
+        total: READ_TOTAL.load(AtomicOrd::Relaxed),
+        unit: unit.to_string(),
+        step_label: STEP_LABEL.lock().unwrap().clone(),
+        step_done: STEP_DONE.load(AtomicOrd::Relaxed),
+        step_total: STEP_TOTAL.load(AtomicOrd::Relaxed),
+    }
+}
+
+/// 少しずつ読みながら、読めた量を報告する。
+/// read_to_end に任せると完了まで何も分からないため、自前で区切って読む。
+fn read_all_counting<R: Read>(mut src: R, expected: u64) -> std::io::Result<Vec<u8>> {
+    let mut buf = Vec::with_capacity(expected as usize);
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let n = src.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        prog_add(n as u64);
+    }
+    Ok(buf)
+}
+
 fn read_zip_entry(path: &PathBuf, name: &str) -> Result<Vec<u8>, String> {
     let file = File::open(path).map_err(|e| e.to_string())?;
     let mut zip = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
-    let mut entry = zip.by_name(name).map_err(|e| e.to_string())?;
-    let mut buf = Vec::with_capacity(entry.size() as usize);
-    entry.read_to_end(&mut buf).map_err(|e| e.to_string())?;
-    Ok(buf)
+    let entry = zip.by_name(name).map_err(|e| e.to_string())?;
+    let size = entry.size();
+    prog_begin(PROG_BYTES, size);
+    let result = read_all_counting(entry, size).map_err(|e| e.to_string());
+    prog_end();
+    result
 }
 
 fn read_rar_entry(path: &PathBuf, name: &str) -> Result<Vec<u8>, String> {
     let mut cursor = unrar::Archive::new(path)
         .open_for_processing()
         .map_err(|e| e.to_string())?;
-    loop {
-        match cursor.read_header().map_err(|e| e.to_string())? {
-            Some(header) => {
+    // Rarは目的のエントリまで先頭からヘッダを辿る。総数は事前に分からないので
+    // 「何件目まで来たか」だけを出す。展開自体はライブラリが全体を一括で返す
+    // 仕様のため、その最中の途中経過は取得できない。
+    prog_begin(PROG_ITEMS, 0);
+    let result = loop {
+        match cursor.read_header() {
+            Ok(Some(header)) => {
+                prog_add(1);
                 let entry_name = header.entry().filename.to_string_lossy().to_string();
                 if entry_name == name {
-                    let (data, _) = header.read().map_err(|e| e.to_string())?;
-                    return Ok(data);
+                    break header.read().map(|(data, _)| data).map_err(|e| e.to_string());
                 }
-                cursor = header.skip().map_err(|e| e.to_string())?;
+                match header.skip() {
+                    Ok(next) => cursor = next,
+                    Err(e) => break Err(e.to_string()),
+                }
             }
-            None => return Err("エントリが見つかりません".into()),
+            Ok(None) => break Err("エントリが見つかりません".into()),
+            Err(e) => break Err(e.to_string()),
         }
-    }
+    };
+    prog_end();
+    result
 }
 
 fn read_7z_entry(path: &PathBuf, name: &str) -> Result<Vec<u8>, String> {
     let mut sz = sevenz_rust::SevenZReader::open(path, sevenz_rust::Password::empty())
         .map_err(|e| e.to_string())?;
     let mut out: Option<Vec<u8>> = None;
-    sz.for_each_entries(|entry, reader| {
+    // 7zは目的のエントリまで先頭から順に辿るため、まず「何件目を見ているか」を出し、
+    // 目的のエントリに当たったらバイト数の表示へ切り替える。
+    let total_entries = sz.archive().files.len() as u64;
+    prog_begin(PROG_ITEMS, total_entries);
+    let scan = sz.for_each_entries(|entry, reader| {
+        prog_add(1);
         if !entry.is_directory() && entry.name() == name {
-            let mut buf = Vec::new();
-            reader.read_to_end(&mut buf)?;
-            out = Some(buf);
+            let size = entry.size();
+            prog_begin(PROG_BYTES, size);
+            out = Some(read_all_counting(reader, size)?);
             Ok(false) // 見つかったので走査終了
         } else {
             Ok(true)
         }
-    })
-    .map_err(|e| e.to_string())?;
+    });
+    prog_end();
+    scan.map_err(|e| e.to_string())?;
     out.ok_or_else(|| "エントリが見つかりません".into())
 }
 
@@ -1430,16 +1573,26 @@ fn build_sorted_entries(path: &str, format: Format) -> Result<Vec<PageEntry>, St
         Format::Folder => unreachable!("detect_format は Folder を返さない"),
     };
     let mut entries: Vec<PageEntry> = Vec::new();
+    // 内部にアーカイブを抱えている場合、1個ごとに時間がかかる。
+    // 細かい進捗は1個ごとに始め直されるので、全体の何個目かは別枠で保つ。
+    let inner_total = names.iter().filter(|n| is_archive_ext(n)).count() as u64;
+    if inner_total > 0 {
+        step_begin("内部のファイルを展開中", inner_total);
+    }
+    let mut inner_done = 0u64;
     for name in names {
         if is_image(&name) {
             entries.push(PageEntry::direct(name));
         } else if is_archive_ext(&name) {
+            inner_done += 1;
+            step_set(inner_done);
             match expand_inner_archive(path, format, &name) {
                 Ok(mut inner) => entries.append(&mut inner),
                 Err(e) => eprintln!("内部アーカイブをスキップ: {name}: {e}"),
             }
         }
     }
+    step_end();
     // 並び順キーを先に計算してからソート（比較のたびに文字列を組み立てない）。
     let mut keyed: Vec<(String, PageEntry)> =
         entries.into_iter().map(|e| (e.sort_key(), e)).collect();
@@ -2201,6 +2354,8 @@ pub fn run() {
             read_text_file,
             list_places,
             dir_exists,
+            get_file_size,
+            get_read_progress,
             list_favorites,
             add_favorite,
             remove_favorite,

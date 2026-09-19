@@ -219,11 +219,24 @@
         </div>
       </div>
 
-      <!-- サムネイル準備の進捗（読み込み完了数/全体数） -->
-      <div id="progress" class="hidden">
-        <span id="progress-text"></span>
-        <div class="progress-track">
-          <div id="progress-fill"></div>
+      <!-- 準備状況の表示。開いている最中と、その後の裏方の準備が同時に出ても
+           重ならないよう縦に積む。どちらも「進めています」を伝えるためのもの。 -->
+      <div id="status-area">
+        <!-- ファイルを開いている最中。終わりが読めないため割合ではなく
+             「動いている」ことを示す帯にしている（ネットワークでは数十秒かかる） -->
+        <div id="loading-note" class="hidden">
+          <span id="loading-name"></span>
+          <span id="loading-step" class="hidden"></span>
+          <span id="loading-phase"></span>
+          <div class="loading-bar"><div class="loading-bar-fill"></div></div>
+        </div>
+
+        <!-- サムネイル準備の進捗（読み込み完了数/全体数） -->
+        <div id="progress" class="hidden">
+          <span id="progress-text"></span>
+          <div class="progress-track">
+            <div id="progress-fill"></div>
+          </div>
         </div>
       </div>
 

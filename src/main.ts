@@ -1315,6 +1315,7 @@ async function openTextFile(path: string, reset = false) {
     hint.style.display = "none";
     seek.disabled = false;
     if (gridOpen) closeGrid();
+    setOpeningPhase("本文を組み立て中…");
     buildTextView();
     if (!reset) {
       const h = await invoke<{ positions: Record<string, number> }>("get_history");
@@ -1537,6 +1538,8 @@ const TREE_ICONS: Record<string, string> = {
 
 let treeRootDir: string | null = null;
 let treeHighlightPath: string | null = null;
+// 今まさに開こうとしている項目。開き終わるまでツリー上で「読み込み中」として示す。
+let treeLoadingPath: string | null = null;
 const treeExpanded = new Set<string>();
 
 // ドライブ直下からさらに上へ辿った時に出す「場所」一覧。ドライブの一覧と
@@ -1660,7 +1663,10 @@ function buildTreeLevel(entries: TreeEntry[]): HTMLElement {
     node.className = "tree-node";
 
     const row = document.createElement("div");
-    row.className = "tree-row" + (entry.path === treeHighlightPath ? " current" : "");
+    row.className =
+      "tree-row" +
+      (entry.path === treeHighlightPath ? " current" : "") +
+      (entry.path === treeLoadingPath ? " loading" : "");
     row.title = entry.path;
 
     const toggle = document.createElement("span");
@@ -2132,6 +2138,7 @@ async function openArchive(path: string, reset = false) {
     seek.max = String(pageCount - 1);
     if (gridOpen) closeGrid();
     startProgressPolling();
+    setOpeningPhase("1ページ目を読み込み中…");
     await render();
   } catch (e) {
     alert("開けませんでした: " + e);
@@ -2173,6 +2180,7 @@ async function openImageOrFolder(path: string, reset = false) {
     seek.max = String(pageCount - 1);
     if (gridOpen) closeGrid();
     startProgressPolling();
+    setOpeningPhase("1ページ目を読み込み中…");
     await render();
   } catch (e) {
     alert("開けませんでした: " + e);
@@ -2213,6 +2221,7 @@ async function openPdf(path: string, reset = false) {
     seek.disabled = false;
     seek.max = String(pageCount - 1);
     if (gridOpen) closeGrid();
+    setOpeningPhase("1ページ目を読み込み中…");
     await render();
   } catch (e) {
     alert("開けませんでした: " + e);
@@ -2221,16 +2230,124 @@ async function openPdf(path: string, reset = false) {
 
 // 拡張子からアーカイブ／PDF／テキスト／画像・フォルダのどの開き方をすべきか振り分ける。
 async function openPath(path: string) {
-  const ext = extOf(path);
-  if (ARCHIVE_EXTS.includes(ext)) {
-    await openArchive(path);
-  } else if (ext === "pdf") {
-    await openPdf(path);
-  } else if (TEXT_EXTS.includes(ext)) {
-    await openTextFile(path);
-  } else {
-    await openImageOrFolder(path);
+  // ネットワーク上の大きなファイルは開き終わるまで数十秒かかることがある。
+  // その間、選択したことが画面に出ないと「押しても反応しない」と見えるため、
+  // 待ちに入る前に、選んだ項目と読み込み中であることを先に表示する。
+  beginOpening(path);
+  try {
+    const ext = extOf(path);
+    if (ARCHIVE_EXTS.includes(ext)) {
+      await openArchive(path);
+    } else if (ext === "pdf") {
+      await openPdf(path);
+    } else if (TEXT_EXTS.includes(ext)) {
+      await openTextFile(path);
+    } else {
+      await openImageOrFolder(path);
+    }
+  } finally {
+    endOpening();
   }
+}
+
+// ---- 開いている最中の表示 ----
+// ネットワーク上のファイルは開き終わるまで時間がかかる。何も出ないと
+// 固まったように見えるため、選んだ項目と「読み込み中」を先に見せる。
+const loadingNote = document.querySelector<HTMLDivElement>("#loading-note")!;
+const loadingName = document.querySelector<HTMLSpanElement>("#loading-name")!;
+const loadingPhase = document.querySelector<HTMLSpanElement>("#loading-phase")!;
+const loadingStep = document.querySelector<HTMLSpanElement>("#loading-step")!;
+
+// バイト数を読みやすい単位にする。
+function formatBytes(n: number): string {
+  if (n >= 1024 ** 3) return `${(n / 1024 ** 3).toFixed(2)} GB`;
+  if (n >= 1024 ** 2) return `${(n / 1024 ** 2).toFixed(1)} MB`;
+  if (n >= 1024) return `${Math.round(n / 1024)} KB`;
+  return `${n} B`;
+}
+
+function beginOpening(path: string) {
+  treeLoadingPath = path;
+  treeHighlightPath = path; // 選んだ項目をその場で選択状態にする
+  // 「場所」一覧の表示中は renderTree() が一覧を消してしまうため触らない。
+  if (!treeAtPlaces) renderTree();
+  loadingName.textContent = basenameOf(path);
+  setOpeningPhase("開いています…");
+  loadingStep.textContent = "";
+  loadingStep.classList.add("hidden");
+  loadingNote.classList.remove("hidden");
+  // ファイルの大きさが分かると、待ちが長い理由が伝わる（取得は軽いので先に出す）。
+  invoke<number>("get_file_size", { path })
+    .then((size) => {
+      if (treeLoadingPath === path && size > 0) {
+        loadingName.textContent = `${basenameOf(path)}（${formatBytes(size)}）`;
+      }
+    })
+    .catch(() => {});
+  startReadProgressPolling();
+}
+
+// 読み出し中のページについて「読めた量／全体量」を出し続ける。
+// 段階の文言だけだと、遅い回線では止まって見えるため、数字が動くことで
+// 進んでいると分かるようにする。
+let readProgressTimer: number | undefined;
+function startReadProgressPolling() {
+  window.clearInterval(readProgressTimer);
+  readProgressTimer = window.setInterval(async () => {
+    try {
+      const p = await invoke<{
+        done: number;
+        total: number;
+        unit: string;
+        stepLabel: string;
+        stepDone: number;
+        stepTotal: number;
+      }>("get_read_progress");
+
+      // 上段：大きな段取り（内部アーカイブの何個目か等）。中を1個処理するたびに
+      // 下段は始め直されるため、全体のどのあたりかは上段で保つ。
+      loadingStep.textContent = p.stepLabel
+        ? `${p.stepLabel} ${p.stepDone.toLocaleString()} / ${p.stepTotal.toLocaleString()}`
+        : "";
+      loadingStep.classList.toggle("hidden", !p.stepLabel);
+
+      if (!p.unit) return; // 細かい計測は走っていない
+      if (p.unit === "bytes") {
+        const pct = p.total > 0 ? Math.min(100, Math.round((p.done / p.total) * 100)) : 0;
+        setOpeningPhase(
+          `読み込み中 ${formatBytes(p.done)} / ${formatBytes(p.total)}（${pct}%）`
+        );
+      } else {
+        // 件数。総数が分からない形式（Rar）は実数だけを出す。
+        const n = p.done.toLocaleString();
+        setOpeningPhase(
+          p.total > 0
+            ? `ファイルを確認中 ${n} / ${p.total.toLocaleString()} 件`
+            : `ファイルを確認中 ${n} 件`
+        );
+      }
+    } catch {
+      stopReadProgressPolling();
+    }
+  }, 200); // 数字が動いて見える程度の間隔
+}
+
+function stopReadProgressPolling() {
+  window.clearInterval(readProgressTimer);
+  readProgressTimer = undefined;
+}
+
+// 今どの段階にいるかを出す。所要時間は読めないが、段階が進むこと自体が
+// 「止まっていない」証拠になるため、節目ごとに文言を差し替える。
+function setOpeningPhase(text: string) {
+  loadingPhase.textContent = text;
+}
+
+function endOpening() {
+  treeLoadingPath = null;
+  stopReadProgressPolling();
+  loadingNote.classList.add("hidden");
+  if (!treeAtPlaces) renderTree();
 }
 
 // ---- 巻移動 ----
