@@ -27,7 +27,8 @@
          親フォルダを起点に、上へボタンで階層を遡れる。 -->
     <div id="tree-panel" class="hidden">
       <div id="tree-toolbar">
-        <button id="tree-up-btn" title="上の階層へ">⬆ 上へ</button>
+        <button id="tree-home-btn" title="最上位（ドライブ一覧）へ移動">💻</button>
+        <button id="tree-up-btn" title="上の階層へ">⬆</button>
         <button id="tree-locate-btn" title="現在見ているファイルの位置へ戻る">🎯</button>
         <span id="tree-root-path"></span>
       </div>
@@ -39,7 +40,16 @@
         <button data-sort="size" title="サイズで並び替え">サイズ</button>
       </div>
       <div id="tree-scroll"></div>
+      <!-- お気に入りの場所：ツリーのどこを見ていても常に出しておく（開閉可） -->
+      <div id="tree-favorites">
+        <div id="tree-fav-header" title="クリックで開閉">
+          <span>⭐ お気に入りの場所</span><span id="tree-fav-caret">▼</span>
+        </div>
+        <div id="tree-fav-list"></div>
+      </div>
     </div>
+    <!-- ツリーと表示領域の境界。左右にドラッグして幅を変えられる -->
+    <div id="tree-resizer" class="hidden" title="ドラッグで幅を変更"></div>
     <div id="viewer">
       <!-- 背景の透かしロゴ。#viewer自身の背景色より上・他の表示より下に負のz-indexで配置 -->
       <img id="bg-watermark" src="/watermark.png" alt="" draggable="false" />
@@ -53,6 +63,9 @@
 
       <!-- 本文表示（txt / md）。画像と同じくページ送りで読む -->
       <div id="textview" class="hidden"><div id="textview-body"></div></div>
+
+      <!-- フォルダツリーの右クリックメニュー。項目はJS側の定義から組み立てる -->
+      <div id="tree-context" class="dropdown-menu hidden"></div>
 
       <!-- 同梱テキスト：アーカイブ／フォルダに含まれる説明書き等を必要時に開く。
            画像のページ列には混ぜないため、ここから選ぶ形にしている。 -->

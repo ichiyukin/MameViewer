@@ -121,22 +121,32 @@ fn get_history() -> HistoryData {
 }
 
 /// 現在のページ位置を「巻」ごとに記憶し、最後に開いた巻としても記録する。
+/// ページを送るたびに呼ばれる＝ディスク書き込みが読書中の操作と競合するため、
+/// 同期コマンド（メインスレッド実行）にはしない。ここを同期にしていた頃は、
+/// サムネイル生成でディスクが混んでいる最中に書き込み待ちが伸び、
+/// 画面が一瞬止まる原因になっていた。
 #[tauri::command]
-fn save_position(anchor: String, page: usize) -> Result<(), String> {
-    let mut h = HISTORY.lock().unwrap();
-    h.positions.insert(anchor.clone(), page);
-    h.last_opened = Some(anchor);
-    persist_history(&h);
-    Ok(())
+async fn save_position(anchor: String, page: usize) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut h = HISTORY.lock().unwrap();
+        h.positions.insert(anchor.clone(), page);
+        h.last_opened = Some(anchor);
+        persist_history(&h);
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// 巻末に達した時の挙動（ループ／次の巻へ）を設定する。
 #[tauri::command]
-fn set_end_behavior(mode: String) -> Result<(), String> {
-    let mut h = HISTORY.lock().unwrap();
-    h.end_behavior = mode;
-    persist_history(&h);
-    Ok(())
+async fn set_end_behavior(mode: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut h = HISTORY.lock().unwrap();
+        h.end_behavior = mode;
+        persist_history(&h);
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 // ---- 画質設定（リサイズフィルター） ----
@@ -531,6 +541,91 @@ fn persist_shelf(list: &[ShelfItem]) {
 
 static SHELF: LazyLock<Mutex<Vec<ShelfItem>>> = LazyLock::new(|| Mutex::new(load_shelf_from_disk()));
 
+// ---- 場所のお気に入り ----
+// 本棚が「本」のお気に入りなのに対し、こちらは「場所（フォルダ）」のお気に入り。
+// NASの深い階層など、毎回辿るのが手間な置き場へ一発で移るために使う。
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct FavoritePlace {
+    /// フォルダのパス。ネットワーク上の場所もそのまま入る。
+    path: String,
+    /// 一覧に出す名前（既定はフォルダ名）。
+    name: String,
+    #[serde(rename = "addedAt", default)]
+    added_at: u64,
+}
+
+fn favorites_path() -> PathBuf {
+    let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(base).join("MameViewer").join("favorites.json")
+}
+
+fn load_favorites_from_disk() -> Vec<FavoritePlace> {
+    std::fs::read_to_string(favorites_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn persist_favorites(list: &[FavoritePlace]) {
+    let path = favorites_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(list) {
+        let _ = std::fs::write(&path, json);
+    }
+}
+
+static FAVORITES: LazyLock<Mutex<Vec<FavoritePlace>>> =
+    LazyLock::new(|| Mutex::new(load_favorites_from_disk()));
+
+/// 登録済みの場所を新しい順に返す。
+/// 重要：ここで実在確認（is_dir 等）はしない。切断中のネットワーク上の場所に
+/// 触れると数秒返ってこないことがあり、一覧表示そのものが固まるため。
+/// 開けるかどうかは、実際に開こうとした時点で分かればよい。
+#[tauri::command]
+fn list_favorites() -> Vec<FavoritePlace> {
+    let mut list = FAVORITES.lock().unwrap().clone();
+    list.sort_by(|a, b| b.added_at.cmp(&a.added_at));
+    list
+}
+
+/// 場所をお気に入りに登録する（既に同じパスがあれば何もしない）。
+#[tauri::command]
+async fn add_favorite(path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let name = Path::new(&path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            // ドライブ直下やネットワーク共有の直下はファイル名が取れないのでパスを名前にする。
+            .unwrap_or_else(|| path.clone());
+        let mut list = FAVORITES.lock().unwrap();
+        if list.iter().any(|f| f.path == path) {
+            return;
+        }
+        list.push(FavoritePlace {
+            path,
+            name,
+            added_at: now_epoch_secs(),
+        });
+        persist_favorites(&list);
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// 登録済みの場所を外す。
+#[tauri::command]
+async fn remove_favorite(path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut list = FAVORITES.lock().unwrap();
+        list.retain(|f| f.path != path);
+        persist_favorites(&list);
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
 fn now_epoch_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -545,6 +640,84 @@ async fn add_to_shelf(anchor: String, page: usize) -> Result<(), String> {
         let thumb = make_thumbnail(page)?;
         let thumb_base64 =
             base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &*thumb);
+        let file_name = Path::new(&anchor)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let mut list = SHELF.lock().unwrap();
+        if let Some(existing) = list.iter_mut().find(|s| s.anchor == anchor) {
+            existing.thumb_base64 = thumb_base64;
+        } else {
+            list.push(ShelfItem {
+                anchor,
+                file_name,
+                thumb_base64,
+                added_at: now_epoch_secs(),
+            });
+        }
+        persist_shelf(&list);
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 指定パス（アーカイブ／フォルダ／画像）の先頭ページから表紙を作って本棚へ登録する。
+/// 今開いている本には一切触れない（ARCHIVE を経由せず、パスから直接読む）。
+/// ツリーの右クリックから、読んでいる途中の本を閉じずに別の本を登録するために使う。
+#[tauri::command]
+async fn add_path_to_shelf(path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let p = PathBuf::from(&path);
+        // 表紙にする1枚の生バイト列と、本棚に記録する識別パスを決める。
+        let (anchor, raw) = if p.is_dir() || !is_archive_ext(&path) {
+            // フォルダ／単独画像：基点フォルダの先頭画像を表紙にする。
+            let dir = resolve_base_dir(&p)?;
+            let mut entries = list_folder(&dir, false)?;
+            if entries.is_empty() {
+                return Err("画像が見つかりませんでした".into());
+            }
+            entries.sort_by(|a, b| natural_cmp(a, b));
+            let first = std::fs::read(&entries[0]).map_err(|e| e.to_string())?;
+            (dir.to_string_lossy().to_string(), first)
+        } else {
+            // アーカイブ：中身を走査して先頭ページを表紙にする。
+            let format = detect_format(&path)?;
+            let entries = build_sorted_entries(&path, format)?;
+            let first = entries.first().ok_or("画像が見つかりませんでした")?;
+            let raw = match &first.container {
+                None => read_entry_from(&p, format, &first.name)?,
+                Some(inner) => {
+                    // 入れ子アーカイブの中が先頭の場合。
+                    if let Some(tp) = &inner.temp_path {
+                        read_rar_entry(tp, &first.name)?
+                    } else {
+                        let bytes = get_inner_bytes(&p, format, inner)?;
+                        match inner.format {
+                            Format::Zip => read_zip_entry_bytes(&bytes, &first.name)?,
+                            Format::SevenZ => read_7z_entry_bytes(&bytes, &first.name)?,
+                            _ => return Err("対応していない内部アーカイブ形式です".into()),
+                        }
+                    }
+                }
+            };
+            (path.clone(), raw)
+        };
+
+        let img = image::load_from_memory(&raw).map_err(|e| format!("画像デコード失敗: {e}"))?;
+        let rgb = img.thumbnail(THUMB_MAX, THUMB_MAX).to_rgb8();
+        let mut out = Cursor::new(Vec::new());
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 80)
+            .encode(
+                rgb.as_raw(),
+                rgb.width(),
+                rgb.height(),
+                image::ExtendedColorType::Rgb8,
+            )
+            .map_err(|e| format!("JPEGエンコード失敗: {e}"))?;
+        let thumb_base64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, out.get_ref());
+
         let file_name = Path::new(&anchor)
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -832,6 +1005,114 @@ struct TreeEntry {
     mtime: u64,
     /// ファイルサイズ（バイト）。フォルダは0。フロントの並び替えに使う。
     size: u64,
+}
+
+/// ツリーの最上位に並べる「場所」。ドライブと、よく使うフォルダをまとめて返す。
+/// ドライブ直下からさらに上へ辿った時の行き先で、ここから別のドライブへ移れる。
+#[derive(serde::Serialize)]
+struct PlaceEntry {
+    /// 画面に出す名前（例："ローカル (C:)" / "デスクトップ"）。
+    name: String,
+    path: String,
+    /// "drive-fixed" | "drive-remote" | "drive-removable" | "drive-other" | "folder"
+    kind: String,
+}
+
+/// 接続されているドライブ文字を列挙する。
+/// kernel32へ直接問い合わせる（A〜Zを順に開いて確かめる方式だと、
+/// 切断中のネットワークドライブで数秒固まるため）。
+#[cfg(windows)]
+fn list_drive_roots() -> Vec<(String, u32)> {
+    // GetLogicalDrives はビットマスクを返すだけでドライブには触れない。
+    // GetDriveTypeW も種別を返すだけで、実際の接続確認は行わない（＝固まらない）。
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetLogicalDrives() -> u32;
+        fn GetDriveTypeW(root: *const u16) -> u32;
+    }
+    let mask = unsafe { GetLogicalDrives() };
+    let mut out = Vec::new();
+    for i in 0..26u32 {
+        if mask & (1 << i) == 0 {
+            continue;
+        }
+        let letter = (b'A' + i as u8) as char;
+        let root = format!("{letter}:\\");
+        let wide: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
+        let kind = unsafe { GetDriveTypeW(wide.as_ptr()) };
+        out.push((root, kind));
+    }
+    out
+}
+
+#[cfg(not(windows))]
+fn list_drive_roots() -> Vec<(String, u32)> {
+    vec![("/".to_string(), 3)]
+}
+
+/// ツリー最上位の「場所」一覧（ドライブ＋よく使うフォルダ）を返す。
+#[tauri::command]
+async fn list_places() -> Result<Vec<PlaceEntry>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut places = Vec::new();
+        for (root, drive_type) in list_drive_roots() {
+            // DRIVE_REMOVABLE=2, FIXED=3, REMOTE=4, CDROM=5, RAMDISK=6
+            let (kind, label) = match drive_type {
+                2 => ("drive-removable", "リムーバブル"),
+                3 => ("drive-fixed", "ローカル"),
+                4 => ("drive-remote", "ネットワーク"),
+                5 => ("drive-other", "CD/DVD"),
+                _ => ("drive-other", "ドライブ"),
+            };
+            let letter = root.trim_end_matches('\\');
+            places.push(PlaceEntry {
+                name: format!("{label} ({letter})"),
+                path: root,
+                kind: kind.to_string(),
+            });
+        }
+        // よく使うフォルダ。存在するものだけを並べる
+        // （クラウドの同期フォルダも、Windowsから見れば普通のフォルダなのでここに出る）。
+        if let Ok(home) = std::env::var("USERPROFILE") {
+            let home = PathBuf::from(home);
+            for (dir, label) in [
+                ("Desktop", "デスクトップ"),
+                ("Documents", "ドキュメント"),
+                ("Pictures", "ピクチャ"),
+                ("Downloads", "ダウンロード"),
+            ] {
+                let p = home.join(dir);
+                if p.is_dir() {
+                    places.push(PlaceEntry {
+                        name: label.to_string(),
+                        path: p.to_string_lossy().to_string(),
+                        kind: "folder".to_string(),
+                    });
+                }
+            }
+        }
+        if let Ok(onedrive) = std::env::var("OneDrive") {
+            let p = PathBuf::from(&onedrive);
+            if p.is_dir() {
+                places.push(PlaceEntry {
+                    name: "OneDrive".to_string(),
+                    path: onedrive,
+                    kind: "folder".to_string(),
+                });
+            }
+        }
+        Ok(places)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 指定パスが開けるフォルダかを確かめる（パス直接入力の検証用）。
+#[tauri::command]
+async fn dir_exists(path: String) -> bool {
+    tauri::async_runtime::spawn_blocking(move || Path::new(&path).is_dir())
+        .await
+        .unwrap_or(false)
 }
 
 fn entry_kind(name: &str, is_dir: bool) -> String {
@@ -1912,11 +2193,17 @@ pub fn run() {
             list_tree_dir,
             get_parent_dir,
             add_to_shelf,
+            add_path_to_shelf,
             remove_from_shelf,
             list_shelf,
             is_in_shelf,
             read_file_bytes,
             read_text_file,
+            list_places,
+            dir_exists,
+            list_favorites,
+            add_favorite,
+            remove_favorite,
             list_archive_texts,
             read_archive_text
         ])

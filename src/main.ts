@@ -1020,11 +1020,15 @@ function applyLayoutSettled() {
 // renderSingle() 内の decode() 後の処理と重複するうえ、こちらにはページ切替の
 // ガード（idx/gen チェック）が無く、素早いページ送り時に古い寸法で上書きして
 // 表示倍率がずれることがあったため削除した（renderSingle 側の処理のみで足りる）。
-window.addEventListener("resize", () => {
+// 表示領域の広さが変わった時の作り直し。ウィンドウのリサイズと、
+// ツリーパネルの幅変更の両方から呼ぶ。
+function relayoutForViewerSize() {
   // 本文は画面幅で段組みが変わる＝総ページ数も変わるため、組み直す。
   if (pageSource === "text") layoutTextPages();
   else applyLayoutSettled();
-});
+}
+
+window.addEventListener("resize", relayoutForViewerSize);
 
 // ---- 表示 ----
 // 見開き時、実際に画面へ表示しているページ数（1 または 2）。
@@ -1477,9 +1481,21 @@ function schedulePositionSave() {
   window.clearTimeout(saveTimer);
   const anchor = currentAnchor;
   const page = current;
+  // 読書中はページを次々に送るため、書き込みは最後の1回にまとめたい。
+  // 0.5秒だと連続してめくる速さと競合して書き込み回数が増えるので、間隔を広げる
+  // （途中で閉じた場合に失うのは直前のめくり1回分だけなので実害は小さい）。
   saveTimer = window.setTimeout(() => {
     invoke("save_position", { anchor, page }).catch(() => {});
-  }, 500);
+  }, 1500);
+}
+
+// 待機中の保存を今すぐ書き出す。間隔を広げた分、閉じる直前の位置を取りこぼさないため。
+function flushPositionSave() {
+  if (saveTimer === undefined) return;
+  window.clearTimeout(saveTimer);
+  saveTimer = undefined;
+  if (!currentAnchor) return;
+  invoke("save_position", { anchor: currentAnchor, page: current }).catch(() => {});
 }
 
 // ウインドウタイトルに現在読み込んでいるファイル（アーカイブ/フォルダ）名を表示する。
@@ -1510,6 +1526,7 @@ const treeUpBtn = document.querySelector<HTMLButtonElement>("#tree-up-btn")!;
 const treeLocateBtn = document.querySelector<HTMLButtonElement>("#tree-locate-btn")!;
 const treeRootPathEl = document.querySelector<HTMLSpanElement>("#tree-root-path")!;
 const treeScrollEl = document.querySelector<HTMLDivElement>("#tree-scroll")!;
+const treeSortbar = document.querySelector<HTMLDivElement>("#tree-sortbar")!;
 
 const TREE_ICONS: Record<string, string> = {
   folder: "📁",
@@ -1521,6 +1538,73 @@ const TREE_ICONS: Record<string, string> = {
 let treeRootDir: string | null = null;
 let treeHighlightPath: string | null = null;
 const treeExpanded = new Set<string>();
+
+// ドライブ直下からさらに上へ辿った時に出す「場所」一覧。ドライブの一覧と
+// よく使うフォルダを並べ、ここから別のドライブへ移れるようにする
+// （従来はドライブ直下が行き止まりで、開いた本と別のドライブへ移れなかった）。
+interface PlaceEntry {
+  name: string;
+  path: string;
+  kind: string;
+}
+// 登録した場所（フォルダのお気に入り）。本棚＝本のお気に入りとは役割が別。
+interface FavoritePlace {
+  path: string;
+  name: string;
+  addedAt: number;
+}
+let treeAtPlaces = false;
+
+// ツリーの移動履歴。サイドボタンで「戻る／進む」ができるようにする。
+// 記録するのは表示起点の移動だけで、フォルダの開閉は含めない
+// （エクスプローラーの戻る／進むと同じ考え方）。
+type TreeLocation = { kind: "places" } | { kind: "dir"; path: string; highlight: string | null };
+let treeHistory: TreeLocation[] = [];
+let treeHistoryIndex = -1;
+let treeNavigating = false; // 履歴を辿っている最中は新たに積まない
+
+function pushTreeHistory(loc: TreeLocation) {
+  if (treeNavigating) return;
+  const cur = treeHistory[treeHistoryIndex];
+  // 同じ場所への移動は積まない（重複で戻る回数が増えるのを防ぐ）
+  if (cur && cur.kind === loc.kind) {
+    if (loc.kind === "places") return;
+    if (cur.kind === "dir" && cur.path === loc.path) return;
+  }
+  treeHistory = treeHistory.slice(0, treeHistoryIndex + 1); // 分岐したら先の履歴は捨てる
+  treeHistory.push(loc);
+  treeHistoryIndex = treeHistory.length - 1;
+}
+
+async function applyTreeLocation(loc: TreeLocation) {
+  treeNavigating = true;
+  try {
+    if (loc.kind === "places") await showPlaces();
+    else await setTreeRoot(loc.path, loc.highlight);
+  } finally {
+    treeNavigating = false;
+  }
+}
+
+async function treeGoBack() {
+  if (treeHistoryIndex <= 0) return;
+  treeHistoryIndex--;
+  await applyTreeLocation(treeHistory[treeHistoryIndex]);
+}
+
+async function treeGoForward() {
+  if (treeHistoryIndex >= treeHistory.length - 1) return;
+  treeHistoryIndex++;
+  await applyTreeLocation(treeHistory[treeHistoryIndex]);
+}
+
+const PLACE_ICONS: Record<string, string> = {
+  "drive-fixed": "💽",
+  "drive-remote": "🌐",
+  "drive-removable": "🔌",
+  "drive-other": "💿",
+  folder: "📁",
+};
 
 // 並び替え設定（次回起動時も維持）。
 let treeSortKey: TreeSortKey = (localStorage.getItem("treeSortKey") as TreeSortKey | null) || "name";
@@ -1592,6 +1676,11 @@ function buildTreeLevel(entries: TreeEntry[]): HTMLElement {
     name.textContent = entry.name;
 
     row.append(toggle, icon, name);
+    row.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      e.stopPropagation(); // 画面の右クリック（前のページへ）を発火させない
+      openTreeContext(entry, e.clientX, e.clientY);
+    });
     row.addEventListener("click", () => {
       if (entry.isDir) toggleTreeNode(entry.path);
       else if (
@@ -1649,16 +1738,182 @@ async function toggleTreeNode(path: string) {
   renderTree();
 }
 
+// 「場所」一覧を表示する（ドライブ直下からさらに上へ辿った時の行き先）。
+async function showPlaces() {
+  pushTreeHistory({ kind: "places" });
+  treeAtPlaces = true;
+  treeRootDir = null;
+  treeRootPathEl.textContent = "PC";
+  treeRootPathEl.title = "この PC の場所";
+  treeUpBtn.disabled = true; // ここが最上位
+  treeSortbar.classList.add("hidden"); // ドライブ一覧に並び替えは要らない
+  treeScrollEl.innerHTML = "";
+  treeScrollEl.appendChild(buildPathInputRow());
+  try {
+    const places = await invoke<PlaceEntry[]>("list_places");
+    if (!treeAtPlaces) return; // 取得中に別の場所へ移っていた
+
+    // お気に入りはツリー下部に常設しているので、ここには重ねて出さない。
+    const drives = places.filter((p) => p.kind.startsWith("drive-"));
+    const folders = places.filter((p) => !p.kind.startsWith("drive-"));
+    if (drives.length > 0) {
+      treeScrollEl.appendChild(buildPlaceHeading("ドライブ"));
+      for (const p of drives) {
+        treeScrollEl.appendChild(buildPlaceRow(PLACE_ICONS[p.kind] ?? "💽", p.name, p.path));
+      }
+    }
+    if (folders.length > 0) {
+      treeScrollEl.appendChild(buildPlaceHeading("よく使う場所"));
+      for (const p of folders) {
+        treeScrollEl.appendChild(buildPlaceRow(PLACE_ICONS[p.kind] ?? "📁", p.name, p.path));
+      }
+    }
+  } catch (e) {
+    console.error("場所一覧の取得に失敗:", e);
+  }
+}
+
+function buildPlaceHeading(text: string): HTMLElement {
+  const h = document.createElement("div");
+  h.className = "tree-heading";
+  h.textContent = text;
+  return h;
+}
+
+function buildPlaceRow(icon: string, label: string, path: string): HTMLElement {
+  const row = document.createElement("div");
+  row.className = "tree-row";
+  row.title = path;
+  const iconEl = document.createElement("span");
+  iconEl.className = "tree-icon";
+  iconEl.textContent = icon;
+  const name = document.createElement("span");
+  name.className = "tree-name";
+  name.textContent = label;
+  row.append(iconEl, name);
+  row.addEventListener("click", async () => {
+    // 切断中のネットワーク上の場所はここで初めて失敗が分かる（一覧表示時は確認しない）。
+    const ok = await invoke<boolean>("dir_exists", { path }).catch(() => false);
+    if (!ok) {
+      alert("開けませんでした。接続状態をご確認ください:\n" + path);
+      return;
+    }
+    await setTreeRoot(path, null);
+  });
+  return row;
+}
+
+// ---- お気に入りの場所（ツリー下部に常設） ----
+// ツリーのどこを見ていても、登録した置き場へ一手で移れるようにする。
+const treeFavList = document.querySelector<HTMLDivElement>("#tree-fav-list")!;
+const treeFavHeader = document.querySelector<HTMLDivElement>("#tree-fav-header")!;
+const treeFavCaret = document.querySelector<HTMLSpanElement>("#tree-fav-caret")!;
+let treeFavCollapsed = localStorage.getItem("treeFavCollapsed") === "true";
+
+function applyFavCollapsed() {
+  treeFavList.classList.toggle("hidden", treeFavCollapsed);
+  treeFavCaret.textContent = treeFavCollapsed ? "▲" : "▼";
+}
+
+treeFavHeader.addEventListener("click", () => {
+  treeFavCollapsed = !treeFavCollapsed;
+  localStorage.setItem("treeFavCollapsed", String(treeFavCollapsed));
+  applyFavCollapsed();
+});
+
+async function refreshFavorites() {
+  try {
+    const favorites = await invoke<FavoritePlace[]>("list_favorites");
+    treeFavList.innerHTML = "";
+    if (favorites.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "tree-fav-empty";
+      empty.textContent = "フォルダを右クリックして追加できます";
+      treeFavList.appendChild(empty);
+      return;
+    }
+    for (const fav of favorites) {
+      const row = buildPlaceRow("⭐", fav.name, fav.path);
+      row.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        openFavoriteContext(fav, e.clientX, e.clientY);
+      });
+      treeFavList.appendChild(row);
+    }
+  } catch (e) {
+    console.error("お気に入りの取得に失敗:", e);
+  }
+}
+
+applyFavCollapsed();
+refreshFavorites();
+
+// お気に入り行の右クリック（解除のみ）。
+function openFavoriteContext(fav: FavoritePlace, clientX: number, clientY: number) {
+  treeContextEl.innerHTML = "";
+  const btn = document.createElement("button");
+  btn.textContent = "お気に入りから外す";
+  btn.addEventListener("click", async () => {
+    closeTreeContext();
+    await invoke("remove_favorite", { path: fav.path }).catch(() => {});
+    await refreshFavorites();
+  });
+  treeContextEl.appendChild(btn);
+  treeContextEl.classList.remove("hidden");
+  const rect = treeContextEl.getBoundingClientRect();
+  treeContextEl.style.left = `${Math.max(4, Math.min(clientX, window.innerWidth - rect.width - 4))}px`;
+  treeContextEl.style.top = `${Math.max(4, Math.min(clientY, window.innerHeight - rect.height - 4))}px`;
+}
+
+// 一覧に出ない場所（`\\server\share` 等）へ移るための入力欄。
+// 常設せず「場所」一覧の中だけに置く（普段の画面を増やさないため）。
+function buildPathInputRow(): HTMLElement {
+  const wrap = document.createElement("div");
+  wrap.className = "tree-path-entry";
+  const input = document.createElement("input");
+  input.type = "text";
+  input.placeholder = "パスを入力（例 \\\\server\\share）";
+  const go = document.createElement("button");
+  go.textContent = "移動";
+  const err = document.createElement("div");
+  err.className = "tree-path-error hidden";
+  const submit = async () => {
+    const path = input.value.trim();
+    if (!path) return;
+    err.classList.add("hidden");
+    go.disabled = true;
+    const ok = await invoke<boolean>("dir_exists", { path }).catch(() => false);
+    go.disabled = false;
+    if (!ok) {
+      // ネットワーク上の場所は、未接続・認証未了でもここに来る。
+      err.textContent = "開けませんでした。パスと接続状態をご確認ください。";
+      err.classList.remove("hidden");
+      return;
+    }
+    await setTreeRoot(path, null);
+  };
+  go.addEventListener("click", submit);
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") submit();
+  });
+  wrap.append(input, go, err);
+  return wrap;
+}
+
 // ツリーの表示起点を切り替える。highlightPathを指定すると、その項目を強調表示する。
 async function setTreeRoot(dir: string, highlightPath: string | null) {
+  pushTreeHistory({ kind: "dir", path: dir, highlight: highlightPath });
+  treeAtPlaces = false;
+  treeSortbar.classList.remove("hidden");
   treeRootDir = dir;
   treeHighlightPath = highlightPath;
   treeRootPathEl.textContent = dir;
   treeRootPathEl.title = dir;
   renderTree(); // 読み込み中表示を即座に見せる
   await fetchTreeDir(dir);
-  const parent = await invoke<string | null>("get_parent_dir", { path: dir }).catch(() => null);
-  treeUpBtn.disabled = !parent;
+  // ドライブ直下（親が無い）でも「場所」一覧へ抜けられるので、上へは常に押せる。
+  treeUpBtn.disabled = false;
   renderTree();
 }
 
@@ -1670,12 +1925,95 @@ async function setTreeRootForAnchor(anchor: string) {
 }
 
 async function goTreeUp() {
-  if (!treeRootDir) return;
+  if (treeAtPlaces) return; // ここが最上位
+  if (!treeRootDir) {
+    await showPlaces();
+    return;
+  }
   const parent = await invoke<string | null>("get_parent_dir", { path: treeRootDir }).catch(() => null);
+  // 親が無い＝ドライブ直下。ここからさらに上は「場所」一覧（別ドライブへの入口）。
   if (parent) await setTreeRoot(parent, treeHighlightPath);
+  else await showPlaces();
 }
 
+// ---- ツリーの右クリックメニュー ----
+// 項目はこの配列に足すだけで増やせるようにしてある（今後の機能追加のため）。
+// enabled を省いた項目は常に表示・実行可能。
+interface TreeMenuItem {
+  label: (entry: TreeEntry) => string;
+  enabled?: (entry: TreeEntry) => boolean;
+  run: (entry: TreeEntry) => void | Promise<void>;
+}
+
+const TREE_MENU_ITEMS: TreeMenuItem[] = [
+  {
+    // 場所のお気に入り。本棚（本のお気に入り）とは役割を分けている。
+    label: () => "お気に入りの場所に追加",
+    enabled: (entry) => entry.isDir,
+    run: async (entry) => {
+      try {
+        await invoke("add_favorite", { path: entry.path });
+        await refreshFavorites();
+      } catch (e) {
+        alert("お気に入りに追加できませんでした: " + e);
+      }
+    },
+  },
+  {
+    label: () => "本棚に追加",
+    // 本＝アーカイブかフォルダ。単独の画像やテキストは本棚の対象にしない。
+    enabled: (entry) => entry.isDir || entry.kind === "archive",
+    run: async (entry) => {
+      try {
+        await invoke("add_path_to_shelf", { path: entry.path });
+        if (shelfOpen) await buildShelfList();
+        updateShelfAddBtnUi();
+      } catch (e) {
+        alert("本棚に追加できませんでした: " + e);
+      }
+    },
+  },
+];
+
+const treeContextEl = document.querySelector<HTMLDivElement>("#tree-context")!;
+
+function closeTreeContext() {
+  treeContextEl.classList.add("hidden");
+}
+
+function openTreeContext(entry: TreeEntry, clientX: number, clientY: number) {
+  treeContextEl.innerHTML = "";
+  for (const item of TREE_MENU_ITEMS) {
+    if (item.enabled && !item.enabled(entry)) continue;
+    const btn = document.createElement("button");
+    btn.textContent = item.label(entry);
+    btn.addEventListener("click", async () => {
+      closeTreeContext();
+      await item.run(entry);
+    });
+    treeContextEl.appendChild(btn);
+  }
+  if (!treeContextEl.firstChild) return; // 出せる項目が無ければ開かない
+  treeContextEl.classList.remove("hidden");
+  // 画面外へはみ出さない位置に置く（右端・下端で折り返す）。
+  const rect = treeContextEl.getBoundingClientRect();
+  const x = Math.min(clientX, window.innerWidth - rect.width - 4);
+  const y = Math.min(clientY, window.innerHeight - rect.height - 4);
+  treeContextEl.style.left = `${Math.max(4, x)}px`;
+  treeContextEl.style.top = `${Math.max(4, y)}px`;
+}
+
+// メニュー以外を押したら閉じる（メニュー自身の項目クリックは上で処理済み）。
+window.addEventListener("mousedown", (e) => {
+  if (!treeContextEl.classList.contains("hidden") && !treeContextEl.contains(e.target as Node)) {
+    closeTreeContext();
+  }
+});
+
 treeUpBtn.addEventListener("click", goTreeUp);
+
+// 最上位（ドライブ一覧）へ一気に戻る。深い階層から「上へ」を連打せずに済む。
+document.querySelector<HTMLButtonElement>("#tree-home-btn")?.addEventListener("click", showPlaces);
 
 // 現在見ているファイル／フォルダの位置へ、ツリーの起点を戻す。
 treeLocateBtn.addEventListener("click", () => {
@@ -1683,8 +2021,61 @@ treeLocateBtn.addEventListener("click", () => {
 });
 
 // フォルダツリーパネルの表示/非表示を切り替える。
+// ---- ツリーパネルの幅変更（境界のドラッグ） ----
+const treeResizer = document.querySelector<HTMLDivElement>("#tree-resizer")!;
+const TREE_WIDTH_MIN = 150;
+let treeWidth = Number(localStorage.getItem("treeWidth")) || 260;
+
+function applyTreeWidth(px: number) {
+  // 表示領域を潰しきらないよう、画面幅の6割までに抑える。
+  const max = Math.max(TREE_WIDTH_MIN, window.innerWidth * 0.6);
+  treeWidth = clampNum(Math.round(px), TREE_WIDTH_MIN, max);
+  treePanel.style.width = `${treeWidth}px`;
+}
+applyTreeWidth(treeWidth); // 前回の幅を復元
+
+let treeResizing = false;
+let treeResizeFramePending = false;
+let treeResizePendingX = 0;
+
+treeResizer.addEventListener("mousedown", (e) => {
+  if (e.button !== 0) return;
+  e.preventDefault(); // ドラッグ中に文字が選択されるのを防ぐ
+  treeResizing = true;
+  treeResizer.classList.add("dragging");
+});
+
+window.addEventListener("mousemove", (e) => {
+  if (!treeResizing) return;
+  // 描画フレームに合わせて間引く（毎イベントで作り直すと画像の再計算が重なる）。
+  treeResizePendingX = e.clientX;
+  if (treeResizeFramePending) return;
+  treeResizeFramePending = true;
+  requestAnimationFrame(() => {
+    treeResizeFramePending = false;
+    applyTreeWidth(treeResizePendingX - treePanel.getBoundingClientRect().left);
+    relayoutForViewerSize(); // 表示領域が狭まった分、画像や本文を合わせ直す
+  });
+});
+
+window.addEventListener("mouseup", () => {
+  if (!treeResizing) return;
+  treeResizing = false;
+  treeResizer.classList.remove("dragging");
+  localStorage.setItem("treeWidth", String(treeWidth));
+  relayoutForViewerSize();
+});
+
 document.querySelector<HTMLButtonElement>("#tree-toggle-btn")?.addEventListener("click", () => {
   treePanel.classList.toggle("hidden");
+  // 境界はパネルと一緒に出し入れする。
+  treeResizer.classList.toggle("hidden", treePanel.classList.contains("hidden"));
+  relayoutForViewerSize();
+  // まだ何も開いていない時に開いたら、行き先として「場所」一覧を出す
+  // （従来は空のまま何も操作できなかった）。
+  if (!treePanel.classList.contains("hidden") && !treeRootDir && !treeAtPlaces) {
+    showPlaces();
+  }
 });
 
 // ---- ツリーの並び替え ----
@@ -2691,9 +3082,26 @@ window.addEventListener(
 // UI領域（バー・メニュー・一覧・案内）上のクリックはページ送りに使わない
 function onUi(e: Event): boolean {
   return !!(e.target as HTMLElement).closest(
-    "#tree-panel, #shelf, #bar, #topbar, #menu, #display-menu, #settings-menu, #grid, #hint, #bookmarks, #resume-dialog, #help, #keybind, #about, #navigator-panel, #texts"
+    "#tree-panel, #tree-resizer, #shelf, #bar, #topbar, #menu, #display-menu, #settings-menu, #grid, #hint, #bookmarks, #resume-dialog, #help, #keybind, #about, #navigator-panel, #texts"
   );
 }
+
+// ボタンを押した時点でUI上かどうかを控えておく。
+// ツリーの行を押すと、その処理の中で一覧が作り直されるため、click が window へ
+// 届く頃には押した要素が既にDOMから外れている。その状態では closest() が親を
+// 辿れず「画像上のクリック」と誤判定され、意図せずページが送られてしまう。
+// 押した瞬間ならDOMは元のままなので、ここで判定して記録しておく。
+let pressedOnUi = false;
+// ツリー上で押したかどうかも同時に控える（サイドボタンの行き先を分けるため）。
+let pressedOnTree = false;
+window.addEventListener(
+  "mousedown",
+  (e) => {
+    pressedOnUi = onUi(e);
+    pressedOnTree = !!(e.target as HTMLElement).closest("#tree-panel");
+  },
+  true // 他のどの処理よりも先に記録する
+);
 
 // マウスサイドボタン：S1(戻る/button3)＝前へ、S2(進む/button4)＝次へ
 // （S2を押しながらホイールを回すと巻送りになる＝下のwheelハンドラ参照）
@@ -2708,7 +3116,7 @@ window.addEventListener("mousedown", (e) => {
     s2UsedForVolume = false;
   }
   // 画像が画面より大きい時、左ボタンドラッグでパン開始（手のひらツール）。
-  if (e.button === 0 && !gridOpen && !onUi(e) && canPan()) {
+  if (e.button === 0 && !gridOpen && !textsOpen && !onUi(e) && canPan()) {
     e.preventDefault();
     panning = true;
     panStartX = e.clientX;
@@ -2734,6 +3142,20 @@ window.addEventListener("mouseup", (e) => {
   if (e.button === 4) {
     s2Down = false;
   }
+  // ツリー上ではサイドボタンを「見ていた場所へ戻る／進む」に割り当てる
+  // （エクスプローラーと同じ操作感。画像の上では従来どおりページ送り）。
+  if (pressedOnTree) {
+    if (e.button === 3) {
+      e.preventDefault();
+      s1UsedForZoom = false;
+      treeGoBack();
+    } else if (e.button === 4) {
+      e.preventDefault();
+      s2UsedForVolume = false;
+      treeGoForward();
+    }
+    return;
+  }
   if (gridOpen || onUi(e)) return; // フォルダツリー等のUI上ではページ移動を発火させない
   if (e.button === 3) {
     e.preventDefault();
@@ -2758,7 +3180,8 @@ window.addEventListener("click", (e) => {
     justPanned = false; // パン直後のクリックはページめくりに使わない
     return;
   }
-  if (gridOpen || bmOpen || helpOpen || keybindOpen || aboutOpen || textsOpen || onUi(e)) return;
+  if (gridOpen || bmOpen || helpOpen || keybindOpen || aboutOpen || textsOpen) return;
+  if (pressedOnUi || onUi(e)) return; // パネル上で押した場合はページ送りに使わない
   if (!menu.classList.contains("hidden")) {
     toggleMenu(false); // メニュー表示中の画面クリックは閉じるだけ
     return;
@@ -2775,7 +3198,8 @@ window.addEventListener("click", (e) => {
 });
 window.addEventListener("contextmenu", (e) => {
   e.preventDefault();
-  if (gridOpen || bmOpen || helpOpen || keybindOpen || aboutOpen || textsOpen || onUi(e)) return;
+  if (gridOpen || bmOpen || helpOpen || keybindOpen || aboutOpen || textsOpen) return;
+  if (pressedOnUi || onUi(e)) return;
   turnPage(-1);
 });
 
@@ -2855,6 +3279,7 @@ window.addEventListener("keydown", (e) => {
 window.addEventListener("blur", () => {
   panning = false;
   viewer.style.cursor = canPan() ? "grab" : "";
+  flushPositionSave(); // 閉じる・切り替える直前に読書位置を確定させる
 });
 
 // パン中の反映は描画フレームに合わせて間引く。ゲーミングマウス等では

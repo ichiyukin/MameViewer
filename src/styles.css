@@ -60,6 +60,22 @@ body {
 #tree-panel.hidden {
   display: none;
 }
+/* ツリーと表示領域の境界。掴みやすいよう見た目より広い当たり判定にしている。 */
+#tree-resizer {
+  flex: 0 0 auto;
+  width: 6px;
+  height: 100%;
+  cursor: col-resize;
+  background: #181818;
+  border-right: 1px solid rgba(255, 255, 255, 0.1);
+}
+#tree-resizer:hover,
+#tree-resizer.dragging {
+  background: var(--accent-dark);
+}
+#tree-resizer.hidden {
+  display: none;
+}
 #tree-toolbar {
   flex: 0 0 auto;
   display: flex;
@@ -69,6 +85,7 @@ body {
   background: #1e1e1e;
   border-bottom: 1px solid rgba(255, 255, 255, 0.08);
 }
+#tree-home-btn,
 #tree-up-btn,
 #tree-locate-btn {
   flex-shrink: 0;
@@ -80,6 +97,7 @@ body {
   border: none;
   cursor: pointer;
 }
+#tree-home-btn:hover,
 #tree-up-btn:hover:not(:disabled),
 #tree-locate-btn:hover {
   background: rgba(255, 255, 255, 0.18);
@@ -168,6 +186,104 @@ body {
 }
 .tree-children {
   margin-left: 16px;
+}
+
+/* 「場所」一覧のパス直接入力。一覧に出ないネットワーク上の場所へ移るためのもの。 */
+.tree-path-entry {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 6px 8px 10px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  margin-bottom: 4px;
+}
+.tree-path-entry input {
+  flex: 1;
+  min-width: 0;
+  padding: 4px 6px;
+  font-family: inherit;
+  font-size: 0.78rem;
+  color: #eee;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+}
+.tree-path-entry button {
+  flex-shrink: 0;
+  padding: 4px 10px;
+  font-family: inherit;
+  font-size: 0.78rem;
+  color: #eee;
+  background: rgba(255, 255, 255, 0.08);
+  border: none;
+  cursor: pointer;
+}
+.tree-path-entry button:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.18);
+}
+.tree-path-error {
+  flex-basis: 100%;
+  font-size: 0.72rem;
+  color: #ff9c9c;
+}
+.tree-path-error.hidden {
+  display: none;
+}
+#tree-sortbar.hidden {
+  display: none;
+}
+
+/* お気に入りの場所：ツリー下部に常設。ツリー本体の領域を奪いすぎないよう
+   高さに上限を設け、溢れる分はこの中でスクロールさせる。 */
+#tree-favorites {
+  flex: 0 0 auto;
+  border-top: 1px solid rgba(255, 255, 255, 0.12);
+  background: #1a1a1a;
+}
+#tree-fav-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 5px 8px;
+  font-size: 0.72rem;
+  color: #999;
+  cursor: pointer;
+  user-select: none;
+}
+#tree-fav-header:hover {
+  background: rgba(255, 255, 255, 0.06);
+  color: #ddd;
+}
+#tree-fav-list {
+  max-height: 30vh;
+  overflow-y: auto;
+  padding-bottom: 4px;
+  font-size: 0.82rem;
+}
+#tree-fav-list.hidden {
+  display: none;
+}
+.tree-fav-empty {
+  padding: 4px 10px 8px;
+  font-size: 0.7rem;
+  color: #666;
+}
+
+/* 「場所」一覧の区切り見出し（お気に入り／ドライブ／よく使う場所）。 */
+.tree-heading {
+  padding: 8px 8px 3px;
+  font-size: 0.7rem;
+  color: #888;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  margin-bottom: 2px;
+}
+
+/* ツリーの右クリックメニュー。位置はJS側がカーソル位置から決める
+   （他のメニューはボタン基準だが、これはカーソル基準のため固定配置にする）。 */
+#tree-context {
+  position: fixed;
+  z-index: 40;
+  min-width: 150px;
+  cursor: default;
 }
 
 /* 背景の透かしロゴ：#viewerの背景色の上・他の表示要素の下に来るよう負のz-indexで配置。
