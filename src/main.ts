@@ -55,7 +55,11 @@ let panStartX = 0;
 let panStartY = 0;
 let panOrigX = 0;
 let panOrigY = 0;
-let justPanned = false; // ドラッグ直後のクリックでページがめくれないようにする一時フラグ
+// ドラッグ直後のクリックでページがめくれないようにする。真偽値ではなく時刻で持つ。
+// ドラッグをウィンドウの外で離すと click が来ないため、真偽値だと立ったまま残り、
+// 次の正当なクリックを1回食べてしまう（ページがめくれない）。
+let justPannedAt = 0;
+const PAN_CLICK_GUARD_MS = 400;
 
 // S2（サイド手前ボタン）を押しながらホイール＝巻送り。単押しは1ページ移動のまま。
 let s2Down = false;
@@ -740,7 +744,11 @@ function canPan(): boolean {
 // 同じ値でもstyleへ代入するとブラウザがスタイル再計算を予約してしまうため、
 // 変化した時だけ書き込む（applyLayoutSettledが1回のページ送りで2回走る都合上、
 // 2回目はほぼ同値になる。無駄な再計算を省くと体感が軽くなる）。
-function setStyleIfChanged(el: HTMLElement, prop: "width" | "height" | "transform", value: string) {
+function setStyleIfChanged(
+  el: HTMLElement,
+  prop: "width" | "height" | "transform" | "margin",
+  value: string
+) {
   if (el.style[prop] !== value) el.style[prop] = value;
 }
 
@@ -777,6 +785,7 @@ function finishLayout() {
 
 // ---- ナビゲーター（画像が画面より大きい時に自動表示するミニマップ） ----
 let navThumbKey = ""; // 現在ナビゲーターに表示中の内容を示すキー（単ページ/見開きの組を区別する）
+let navThumbUrl = ""; // ミニマップに今出している画像のURL（差し替え時に解放する）
 let navigatorWasVisible = false; // 前回のミニマップ表示状態（非表示→表示の瞬間にサムネを用意する）
 
 function updateNavigatorVisibility() {
@@ -817,13 +826,30 @@ function updateNavigatorViewportRect() {
 // （そうしないと見開きなのにナビゲーターだけ単ページ分しか映らないため）。
 // 重要：ミニマップが非表示の間は何もしない（毎ページのサムネ取得＋合成が
 // ページ送りの体感を重くしていたため。表示された瞬間に updateNavigatorVisibility が呼ぶ）。
+/// ビットマップを指定角度だけ回したキャンバスを作る（90/270度では縦横が入れ替わる）。
+function rotateToCanvas(b: ImageBitmap, deg: number): HTMLCanvasElement {
+  const swapped = deg % 180 !== 0;
+  const c = document.createElement("canvas");
+  c.width = Math.max(1, swapped ? b.height : b.width);
+  c.height = Math.max(1, swapped ? b.width : b.height);
+  const g = c.getContext("2d")!;
+  g.translate(c.width / 2, c.height / 2);
+  g.rotate((deg * Math.PI) / 180);
+  g.drawImage(b, -b.width / 2, -b.height / 2);
+  return c;
+}
+
 async function updateNavigatorThumb() {
   if (pageCount === 0) return;
   if (navigatorEl.classList.contains("hidden")) return;
   const isSpread = spreadMode && shownCount === 2;
   const idxLeft = isSpread ? (bindMode === "rtl" ? current + 1 : current) : current;
   const idxRight = isSpread ? (bindMode === "rtl" ? current : current + 1) : current;
-  const key = `${archiveGen}:` + (isSpread ? `spread:${idxLeft}-${idxRight}` : `single:${current}`);
+  // 回転もキーに含める。含めないと、回した後もミニマップが回す前の絵を映し続け、
+  // 表示範囲の枠（回転後の寸法で計算している）と噛み合わなくなる。
+  const key =
+    `${archiveGen}:${rotation}:` +
+    (isSpread ? `spread:${idxLeft}-${idxRight}` : `single:${current}`);
   if (key === navThumbKey) return;
   navThumbKey = key;
   try {
@@ -834,18 +860,25 @@ async function updateNavigatorThumb() {
       })
     );
     if (key !== navThumbKey) return; // 取得中に表示内容が変わった
-    const h = Math.max(...bitmaps.map((b) => b.height), 1);
-    const widths = bitmaps.map((b) => (b.width * h) / b.height);
+    // 画面では「各ページを回してから横に並べる」順序なので、合成も同じ順序で行う。
+    // 並べてから全体を回すと、見開きの左右が入れ替わって見えてしまう。
+    const parts = bitmaps.map((b) => {
+      const src: CanvasImageSource = rotation ? rotateToCanvas(b, rotation) : b;
+      const swapped = rotation % 180 !== 0;
+      return { src, w: swapped ? b.height : b.width, h: swapped ? b.width : b.height };
+    });
+    const h = Math.max(...parts.map((p) => p.h), 1);
+    const widths = parts.map((p) => (p.w * h) / p.h);
     const canvas = document.createElement("canvas");
     canvas.width = Math.max(1, Math.round(widths.reduce((sum, w) => sum + w, 0)));
     canvas.height = Math.round(h);
     const ctx = canvas.getContext("2d")!;
     let x = 0;
-    bitmaps.forEach((b, i) => {
-      ctx.drawImage(b, x, 0, widths[i], h);
+    parts.forEach((p, i) => {
+      ctx.drawImage(p.src, x, 0, widths[i], h);
       x += widths[i];
-      b.close();
     });
+    bitmaps.forEach((b) => b.close());
     // ナビゲーター枠自体を合成画像のアスペクト比に合わせる（矩形計算を正確にするため）。
     const maxSize = 270;
     const ratio = canvas.width / canvas.height || 1;
@@ -858,12 +891,14 @@ async function updateNavigatorThumb() {
       (blob) => {
         if (!blob || key !== navThumbKey) return;
         const url = URL.createObjectURL(blob);
-        const old = navThumb.src;
-        navThumb.onload = () => {
-          if (old.startsWith("blob:")) URL.revokeObjectURL(old);
-          updateNavigatorViewportRect();
-        };
+        // 解放を onload まで遅らせると、次のページの分が先に届いた時に
+        // onload が上書きされ、前のURLが解放されないまま残る。
+        // 差し替えた直後に前の分を解放する（既に読み込み済みなので安全）。
+        const prev = navThumbUrl;
+        navThumbUrl = url;
+        navThumb.onload = () => updateNavigatorViewportRect();
         navThumb.src = url;
+        if (prev.startsWith("blob:")) URL.revokeObjectURL(prev);
       },
       "image/jpeg",
       0.85
@@ -909,7 +944,7 @@ window.addEventListener("mouseup", () => {
   // ミニマップ外まで引っ張って離すと、click はミニマップではなく画像側で
   // 発生する（クリック対象は押した位置と離した位置の共通の親になるため）。
   // onUi() では弾けないので、パン操作と同じくフラグで次のクリックを抑止する。
-  if (navDragging) justPanned = true;
+  if (navDragging) justPannedAt = Date.now();
   navDragging = false;
 });
 
@@ -1026,6 +1061,12 @@ function applyLayoutSpread() {
     setStyleIfChanged(el, "width", `${box.w}px`);
     setStyleIfChanged(el, "height", `${box.h}px`);
     setStyleIfChanged(el, "transform", rotation ? `rotate(${rotation}deg)` : "");
+    // CSSのrotateは「見た目」だけを回し、場所取り（レイアウト箱）は回さない。
+    // 見開きは2枚を横に並べるため、90/270度では箱と見た目のずれぶん
+    // 2枚が中央で重なってしまう。差分を余白で補い、見た目どおりの幅を取らせる。
+    const mx = swapped ? (box.h - box.w) / 2 : 0;
+    const my = swapped ? (box.w - box.h) / 2 : 0;
+    setStyleIfChanged(el, "margin", mx || my ? `${my}px ${mx}px` : "");
   };
   setImgBox(pageLeftEl, left);
   setImgBox(pageRightEl, right);
@@ -1169,8 +1210,10 @@ async function renderSpread() {
     pageRightEl.src = rightUrl;
     img.classList.remove("loaded");
     spread.classList.remove("hidden");
-    applyLayoutSettled();
+    // レイアウトより先に2枚扱いにする。applyLayout はミニマップの用意も呼ぶので、
+    // 1枚のままだと単ページ用の絵を一度作ってから作り直す無駄が出る。
     shownCount = 2;
+    applyLayoutSettled();
     counter.textContent = `${idx + 1}-${idx + 2} / ${pageCount}`;
     seek.value = String(idx);
     flashBar();
@@ -1379,6 +1422,9 @@ function hideTextView() {
 const textsPanel = document.querySelector<HTMLDivElement>("#texts")!;
 const textsList = document.querySelector<HTMLDivElement>("#texts-list")!;
 const textsReader = document.querySelector<HTMLDivElement>("#texts-reader")!;
+// 本文の差し込み先は内側の入れ物。#texts-reader 自体へ書くと入れ物ごと消える。
+const textsReaderBody = document.querySelector<HTMLDivElement>("#texts-reader-body")!;
+let textsReadSeq = 0;
 let textsOpen = false;
 
 async function openTextsPanel() {
@@ -1408,9 +1454,11 @@ async function openTextsPanel() {
 }
 
 async function showArchiveText(name: string) {
+  const mySeq = ++textsReadSeq;
   try {
     const body = await invoke<string>("read_archive_text", { name });
-    textsReader.innerHTML = name.toLowerCase().endsWith(".md")
+    if (mySeq !== textsReadSeq) return; // 読んでいる間に別のテキストが選ばれた
+    textsReaderBody.innerHTML = name.toLowerCase().endsWith(".md")
       ? renderMarkdown(body)
       : renderPlainText(body);
     textsList.classList.add("hidden");
@@ -1662,6 +1710,11 @@ function pushTreeHistory(loc: TreeLocation) {
   }
   treeHistory = treeHistory.slice(0, treeHistoryIndex + 1); // 分岐したら先の履歴は捨てる
   treeHistory.push(loc);
+  // 長時間の閲覧で無制限に伸びるのを防ぐ（古い方から捨てる）。
+  const TREE_HISTORY_MAX = 200;
+  if (treeHistory.length > TREE_HISTORY_MAX) {
+    treeHistory = treeHistory.slice(treeHistory.length - TREE_HISTORY_MAX);
+  }
   treeHistoryIndex = treeHistory.length - 1;
 }
 
@@ -1726,18 +1779,42 @@ function sortedTreeEntries(entries: TreeEntry[]): TreeEntry[] {
     return cmp * dir;
   });
 }
-const treeChildrenCache = new Map<string, TreeEntry[]>();
+// フォルダの中身は外から増減する。一度覚えたまま使い続けると、追加した本が
+// いつまでも出てこない／消した本が残る。かといって開閉のたびに取り直すと重いので、
+// 短い有効期間を設けて、切れていたら取り直す。
+type TreeCacheEntry = { entries: TreeEntry[]; expires: number };
+const treeChildrenCache = new Map<string, TreeCacheEntry>();
+const TREE_CACHE_TTL_MS = 20_000;
+// 取得に失敗した場合（未接続のネットワークドライブ等）は、復帰したらすぐ拾えるよう
+// ごく短い間だけ空として扱う。長く覚えると「繋いだのに永遠に空」になる。
+const TREE_CACHE_FAIL_TTL_MS = 3_000;
+const TREE_CACHE_MAX = 400;
 
-async function fetchTreeDir(path: string): Promise<TreeEntry[]> {
-  const cached = treeChildrenCache.get(path);
-  if (cached) return cached;
+/// 描画用。期限切れでも持っているものを返す（「読み込み中…」に戻すより自然）。
+function cachedTreeEntries(path: string): TreeEntry[] | undefined {
+  return treeChildrenCache.get(path)?.entries;
+}
+
+function putTreeCache(path: string, entries: TreeEntry[], ttl: number) {
+  treeChildrenCache.delete(path); // 挿入順を最新にし直す（古い順に捨てるため）
+  treeChildrenCache.set(path, { entries, expires: Date.now() + ttl });
+  while (treeChildrenCache.size > TREE_CACHE_MAX) {
+    const oldest = treeChildrenCache.keys().next().value;
+    if (oldest === undefined || oldest === path) break;
+    treeChildrenCache.delete(oldest);
+  }
+}
+
+async function fetchTreeDir(path: string, force = false): Promise<TreeEntry[]> {
+  const hit = treeChildrenCache.get(path);
+  if (hit && !force && Date.now() < hit.expires) return hit.entries;
   try {
     const entries = await invoke<TreeEntry[]>("list_tree_dir", { path });
-    treeChildrenCache.set(path, entries);
+    putTreeCache(path, entries, TREE_CACHE_TTL_MS);
     return entries;
   } catch (e) {
     console.error("フォルダ一覧取得失敗:", e);
-    treeChildrenCache.set(path, []); // 失敗時は空扱いにして無限リトライを避ける
+    putTreeCache(path, [], TREE_CACHE_FAIL_TTL_MS);
     return [];
   }
 }
@@ -1788,7 +1865,7 @@ function buildTreeLevel(entries: TreeEntry[]): HTMLElement {
     if (entry.isDir && treeExpanded.has(entry.path)) {
       const childrenWrap = document.createElement("div");
       childrenWrap.className = "tree-children";
-      const cached = treeChildrenCache.get(entry.path);
+      const cached = cachedTreeEntries(entry.path);
       if (cached) {
         childrenWrap.appendChild(buildTreeLevel(cached));
       } else {
@@ -1807,7 +1884,7 @@ function buildTreeLevel(entries: TreeEntry[]): HTMLElement {
 function renderTree() {
   treeScrollEl.innerHTML = "";
   if (!treeRootDir) return;
-  const rootEntries = treeChildrenCache.get(treeRootDir);
+  const rootEntries = cachedTreeEntries(treeRootDir);
   if (!rootEntries) {
     const loading = document.createElement("p");
     loading.textContent = "読み込み中…";
@@ -2808,6 +2885,19 @@ function cycleRotation() {
   panX = 0;
   panY = 0;
   applyLayoutSettled();
+  updateRotationUi();
+  // ミニマップは「隠れていたものが出た瞬間」しか作り直さないので、
+  // 出たままの状態で回した時はここから作り直す。
+  updateNavigatorThumb();
+}
+
+/// 回転の状態をメニューに出す。次の起動まで保持される設定なので、
+/// 表示が斜めのまま起動した時に理由が分かるようにしておく。
+function updateRotationUi() {
+  const btn = displayMenu.querySelector<HTMLButtonElement>('[data-act="rotate"]');
+  if (!btn) return;
+  btn.textContent = rotation === 0 ? "回転（クリックで90°ずつ）" : `回転 ${rotation}°（クリックで90°ずつ）`;
+  btn.classList.toggle("active", rotation !== 0);
 }
 
 function setFitMode(mode: FitMode) {
@@ -2861,6 +2951,7 @@ function setEndBehavior(mode: "loop" | "next") {
 // 初期状態のハイライトを反映（前回終了時の設定を復元）
 setFitMode(fitMode);
 updateBindUi();
+updateRotationUi();
 if (spreadMode) {
   for (const b of displayMenu.querySelectorAll<HTMLButtonElement>('[data-act="spread"]')) {
     b.classList.add("active");
@@ -3188,9 +3279,9 @@ async function updateShelfAddBtnUi() {
     return;
   }
   shelfAddBtn.disabled = false;
-  const inShelf = await invoke<boolean>("is_in_shelf", { anchor: currentAnchor }).catch(
-    () => false
-  );
+  const anchor = currentAnchor; // 問い合わせている間に別の本へ移ることがある
+  const inShelf = await invoke<boolean>("is_in_shelf", { anchor }).catch(() => false);
+  if (anchor !== currentAnchor) return; // 別の本の答えでボタンを書き換えない
   shelfAddBtn.textContent = inShelf ? "この本を本棚から外す" : "この本を追加";
   shelfAddBtn.classList.toggle("remove", inShelf);
 }
@@ -3421,7 +3512,7 @@ window.addEventListener("mouseup", (e) => {
     viewer.style.cursor = canPan() ? "grab" : "";
     // 実際に動かした場合は、直後の click によるページめくりを抑止する。
     if (Math.abs(e.clientX - panStartX) > 2 || Math.abs(e.clientY - panStartY) > 2) {
-      justPanned = true;
+      justPannedAt = Date.now();
     }
     return;
   }
@@ -3465,8 +3556,8 @@ window.addEventListener("mouseup", (e) => {
 
 // マウス左ボタン：次へ　右ボタン：前へ
 window.addEventListener("click", (e) => {
-  if (justPanned) {
-    justPanned = false; // パン直後のクリックはページめくりに使わない
+  if (Date.now() - justPannedAt < PAN_CLICK_GUARD_MS) {
+    justPannedAt = 0; // パン直後のクリックはページめくりに使わない
     return;
   }
   if (gridOpen || bmOpen || helpOpen || keybindOpen || aboutOpen || textsOpen) return;
@@ -3585,7 +3676,7 @@ window.addEventListener("blur", () => {
   navDragging = false;
   treeResizing = false;
   treeResizer.classList.remove("dragging");
-  justPanned = false;
+  justPannedAt = 0;
   viewer.style.cursor = canPan() ? "grab" : "";
   flushPositionSave(); // 閉じる・切り替える直前に読書位置を確定させる
 });

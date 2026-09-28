@@ -221,11 +221,14 @@ fn get_settings() -> ResizeSettings {
 }
 
 #[tauri::command]
-fn set_settings(settings: ResizeSettings) -> Result<(), String> {
-    persist_settings(&settings);
-    *SETTINGS.lock().unwrap() = settings;
-    RESIZED_CACHE.lock().unwrap().clear(); // フィルター変更後は再生成させる
-    Ok(())
+async fn set_settings(settings: ResizeSettings) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        persist_settings(&settings);
+        *SETTINGS.lock().unwrap() = settings;
+        RESIZED_CACHE.lock().unwrap().clear(); // フィルター変更後は再生成させる
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// 縮小/拡大かに応じて使うフィルター名を決める（おまかせ or 詳細設定）。
@@ -406,19 +409,43 @@ fn try_relink_bookmarks(new_path: &str) {
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
-    let mut list = BOOKMARKS.lock().unwrap();
-    let mut changed = false;
-    for b in list.iter_mut() {
-        if b.anchor != new_path
-            && !Path::new(&b.anchor).exists()
-            && b.file_name == name
-            && b.file_size == size
-        {
-            b.anchor = new_path.to_string();
-            changed = true;
-        }
+    // 候補をまず控えてからロックを離す。存在確認は、切断されたネットワーク上の
+    // パスだと1件で数秒待たされることがあり、ロックを握ったまま行うと
+    // しおり一覧など他の操作まで一緒に止まってしまう。
+    let candidates: Vec<String> = {
+        let list = BOOKMARKS.lock().unwrap();
+        list.iter()
+            .filter(|b| b.anchor != new_path && b.file_name == name && b.file_size == size)
+            .map(|b| b.anchor.clone())
+            .collect()
+    };
+    if candidates.is_empty() {
+        return;
     }
-    if changed {
+    let missing: Vec<String> = candidates
+        .into_iter()
+        .filter(|a| !Path::new(a).exists())
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    // 保存もロックの外で行う（書き込みの間だけでも他を待たせないため）。
+    let snapshot = {
+        let mut list = BOOKMARKS.lock().unwrap();
+        let mut changed = false;
+        for b in list.iter_mut() {
+            if missing.iter().any(|a| a == &b.anchor) {
+                b.anchor = new_path.to_string();
+                changed = true;
+            }
+        }
+        if changed {
+            Some(list.clone())
+        } else {
+            None
+        }
+    };
+    if let Some(list) = snapshot {
         persist_bookmarks(&list);
     }
 }
@@ -470,29 +497,52 @@ async fn add_bookmark(anchor: String, page: usize) -> Result<BookmarkView, Strin
 }
 
 /// 指定したしおりを削除する。
+fn remove_bookmark_sync(id: u64) {
+    let snapshot = {
+        let mut list = BOOKMARKS.lock().unwrap();
+        list.retain(|b| b.id != id);
+        list.clone()
+    };
+    persist_bookmarks(&snapshot);
+}
+
 #[tauri::command]
-fn remove_bookmark(id: u64) -> Result<(), String> {
-    let mut list = BOOKMARKS.lock().unwrap();
-    list.retain(|b| b.id != id);
-    persist_bookmarks(&list);
-    Ok(())
+async fn remove_bookmark(id: u64) -> Result<(), String> {
+    // ファイルへの書き込みを伴うので別スレッドで行う（画面を止めない）。
+    tauri::async_runtime::spawn_blocking(move || remove_bookmark_sync(id))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// しおり一覧を返す。anchor を指定すればそのファイルのみ、省略すれば全ファイル横断。
-#[tauri::command]
-fn list_bookmarks(anchor: Option<String>) -> Vec<BookmarkView> {
-    let list = BOOKMARKS.lock().unwrap();
-    list.iter()
-        .filter(|b| anchor.as_deref().map_or(true, |a| b.anchor == a))
+/// 存在確認（exists）は切断されたネットワークドライブで長く待たされる。
+/// ロックの外で行い、しおりの登録・削除を一緒に止めないようにする。
+fn list_bookmarks_sync(anchor: Option<String>) -> Vec<BookmarkView> {
+    let picked: Vec<Bookmark> = {
+        let list = BOOKMARKS.lock().unwrap();
+        list.iter()
+            .filter(|b| anchor.as_deref().is_none_or(|a| b.anchor == a))
+            .cloned()
+            .collect()
+    };
+    picked
+        .into_iter()
         .map(|b| BookmarkView {
-            id: b.id,
-            anchor: b.anchor.clone(),
-            page: b.page,
-            file_name: b.file_name.clone(),
-            thumb_base64: b.thumb_base64.clone(),
             exists: Path::new(&b.anchor).exists(),
+            id: b.id,
+            anchor: b.anchor,
+            page: b.page,
+            file_name: b.file_name,
+            thumb_base64: b.thumb_base64,
         })
         .collect()
+}
+
+#[tauri::command]
+async fn list_bookmarks(anchor: Option<String>) -> Result<Vec<BookmarkView>, String> {
+    tauri::async_runtime::spawn_blocking(move || list_bookmarks_sync(anchor))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// 現在のページが既にしおり登録済みか調べる（ボタン/キーのトグル判定用）。
@@ -759,28 +809,37 @@ async fn add_path_to_shelf(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn remove_from_shelf(anchor: String) -> Result<(), String> {
-    let mut list = SHELF.lock().unwrap();
-    list.retain(|s| s.anchor != anchor);
-    persist_shelf(&list);
-    Ok(())
+async fn remove_from_shelf(anchor: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let snapshot = {
+            let mut list = SHELF.lock().unwrap();
+            list.retain(|s| s.anchor != anchor);
+            list.clone()
+        };
+        persist_shelf(&snapshot);
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// 本棚の一覧を、登録が新しい順に返す。
 #[tauri::command]
-fn list_shelf() -> Vec<ShelfItemView> {
-    let list = SHELF.lock().unwrap();
-    let mut items: Vec<&ShelfItem> = list.iter().collect();
-    items.sort_by(|a, b| b.added_at.cmp(&a.added_at));
-    items
-        .into_iter()
-        .map(|s| ShelfItemView {
-            anchor: s.anchor.clone(),
-            file_name: s.file_name.clone(),
-            thumb_base64: s.thumb_base64.clone(),
-            exists: Path::new(&s.anchor).exists(),
-        })
-        .collect()
+async fn list_shelf() -> Result<Vec<ShelfItemView>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let mut items: Vec<ShelfItem> = SHELF.lock().unwrap().clone();
+        items.sort_by(|a, b| b.added_at.cmp(&a.added_at));
+        items
+            .into_iter()
+            .map(|s| ShelfItemView {
+                exists: Path::new(&s.anchor).exists(),
+                anchor: s.anchor,
+                file_name: s.file_name,
+                thumb_base64: s.thumb_base64,
+            })
+            .collect()
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// 指定の本が本棚に登録済みか（ボタンのトグル表示用）。
@@ -2761,9 +2820,9 @@ mod tests {
         assert!(bm.exists);
 
         // 全ファイル横断・このファイル絞り込みの両方で見つかること。
-        assert_eq!(list_bookmarks(None).len(), 1);
-        assert_eq!(list_bookmarks(Some(zip.to_string())).len(), 1);
-        assert_eq!(list_bookmarks(Some("other.zip".to_string())).len(), 0);
+        assert_eq!(list_bookmarks_sync(None).len(), 1);
+        assert_eq!(list_bookmarks_sync(Some(zip.to_string())).len(), 1);
+        assert_eq!(list_bookmarks_sync(Some("other.zip".to_string())).len(), 0);
         assert_eq!(find_bookmark(zip.to_string(), 2), Some(bm.id));
 
         // ファイルが「移動」したことを模擬（コピー後に元を消す）→ 自動再リンクされること。
@@ -2777,14 +2836,14 @@ mod tests {
                 b.anchor = "C:\\存在しない\\旧パス\\test.zip".to_string();
             }
         }
-        assert!(!list_bookmarks(None)[0].exists, "旧パスは存在しないこと");
+        assert!(!list_bookmarks_sync(None)[0].exists, "旧パスは存在しないこと");
         try_relink_bookmarks(moved.to_str().unwrap());
         // ファイル名が違う（test.zip → mviewer_test_moved.zip）ため再リンクされないことを確認。
-        assert!(!list_bookmarks(None)[0].exists, "ファイル名が異なるため再リンクされない");
+        assert!(!list_bookmarks_sync(None)[0].exists, "ファイル名が異なるため再リンクされない");
 
         // 削除。
-        remove_bookmark(bm.id).unwrap();
-        assert_eq!(list_bookmarks(None).len(), 0);
+        remove_bookmark_sync(bm.id);
+        assert_eq!(list_bookmarks_sync(None).len(), 0);
 
         let _ = std::fs::remove_file(&moved);
         *BOOKMARKS.lock().unwrap() = saved; // 復元
