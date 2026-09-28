@@ -112,7 +112,7 @@ function adjustTextFont(factor: number) {
   textFontRem = next;
   localStorage.setItem("textFontRem", String(textFontRem));
   textviewBody.style.setProperty("--text-size", `${textFontRem}rem`);
-  layoutTextPages(); // 文字サイズが変われば1ページに入る量も変わる
+  layoutTextPages(false); // 文字サイズが変われば1ページに入る量も変わる
 }
 
 // マウスカーソル位置を基準にズームする（カーソルの指す場所がズーム後も同じ位置に留まる）。
@@ -788,6 +788,10 @@ function panLimits(): { maxX: number; maxY: number } {
 // 手のひらツールが有効な状況か＝表示中の画像のいずれかの軸が画面より
 // 大きい場合（原寸表示に限らず、幅/高さ合わせ等ではみ出た場合も含む）。
 function canPan(): boolean {
+  // 本文は段組みで送るので、そもそもパンしない。
+  // ここで弾かないと、前に開いていた画像の寸法(dispW/dispH)が残っている間は
+  // 本文の上でドラッグがパン扱いになり、preventDefault で文字が選択できなくなる。
+  if (pageSource === "text") return false;
   const vw = viewer.clientWidth;
   const vh = viewer.clientHeight;
   return dispW > vw + 0.5 || dispH > vh + 0.5;
@@ -843,8 +847,11 @@ let navigatorWasVisible = false; // 前回のミニマップ表示状態（非�
 function updateNavigatorVisibility() {
   // ミニマップは「画像が実際に画面からはみ出ている時」だけ。
   // パネル（リセットボタン）はズーム中（縮小含む）も出す。
+  // 本文は拡大・パンの対象ではない（拡大は文字サイズの変更に読み替えている）。
+  // 前に開いていた画像の倍率が残っていると、リセットボタンだけ本文の上に出てしまう。
+  const isText = pageSource === "text";
   const pannable = canPan();
-  const zoomed = Math.abs(zoomFactor - 1) > 0.001;
+  const zoomed = !isText && Math.abs(zoomFactor - 1) > 0.001;
   navigatorPanel.classList.toggle("hidden", !(pannable || zoomed));
   navigatorEl.classList.toggle("hidden", !pannable);
   const label = `拡大率をリセット（${Math.round(zoomFactor * 100)}%）`;
@@ -1147,7 +1154,7 @@ function applyLayoutSettled() {
 // ツリーパネルの幅変更の両方から呼ぶ。
 function relayoutForViewerSize() {
   // 本文は画面幅で段組みが変わる＝総ページ数も変わるため、組み直す。
-  if (pageSource === "text") layoutTextPages();
+  if (pageSource === "text") layoutTextPages(false);
   else applyLayoutSettled();
 }
 
@@ -1471,11 +1478,18 @@ function textOffsetOfPage(page: number): number {
 
 function textPageOfOffset(off: number): number {
   if (textPageOffsets.length === 0) return 0;
-  // 表は単調非減少。その文字位置を含む最後のページを返す。
+  // 表は単調非減少。文字が載っていないページは直前と同じ値で埋めてあるため、
+  // 同じ値が並ぶことがある。その場合は「先に出てくる方」を返す
+  // （後ろを返すと、記録した位置より先へ飛んでしまい読み飛ばしになる）。
   let hit = 0;
+  let best = -1;
   for (let i = 0; i < textPageOffsets.length; i++) {
-    if (textPageOffsets[i] <= off) hit = i;
-    else break;
+    const o = textPageOffsets[i];
+    if (o > off) break;
+    if (o > best) {
+      best = o;
+      hit = i;
+    }
   }
   return hit;
 }
@@ -1490,13 +1504,30 @@ function pageOfPositionKey(key: number): number {
   return pageSource === "text" ? textPageOfOffset(key) : key;
 }
 
+// 文字位置の測り直しは、文庫1冊ぶん（約20万文字）で40ms前後かかる。
+// ウィンドウの端をドラッグすると毎フレーム組み直しが走るので、そのたびに
+// 測り直すと明確にカクつく。ドラッグ中は段組みだけ直し、手が止まってから測る。
+let textRemeasureTimer: number | undefined;
+// 連続変更に入る直前の文字位置。測り直しを飛ばしている間、ここへ預けておく
+// （ページ番号は幅の変化で意味が変わるため、番号では預けられない）。
+let textHeldOffset: number | null = null;
+
+function scheduleTextRemeasure() {
+  window.clearTimeout(textRemeasureTimer);
+  textRemeasureTimer = window.setTimeout(() => layoutTextPages(true), 150);
+}
+
 /// 本文を段組みし直して総ページ数を求める。画面サイズ・文字サイズの変更後に呼ぶ。
 /// 組み直すとページ番号の意味が変わるので、直前の文字位置を保って戻す。
-function layoutTextPages() {
+/// remeasure=false は連続変更中の軽い経路（測り直しは手が止まってから行う）。
+function layoutTextPages(remeasure = true) {
   if (textview.classList.contains("hidden")) return;
   const w = textviewBody.clientWidth;
   if (w <= 0) return;
-  const keepOffset = textPageOffsets.length > 0 ? textOffsetOfPage(current) : 0;
+  // 連続変更の初回に、今の文字位置を預ける（以後の組み直しでは触らない）。
+  if (!remeasure && textHeldOffset === null && textPageOffsets.length > 0) {
+    textHeldOffset = textOffsetOfPage(current);
+  }
   textviewBody.style.transform = "";
   textviewBody.style.columnWidth = `${w}px`;
   textviewBody.style.columnGap = `${TEXT_COLUMN_GAP}px`;
@@ -1505,10 +1536,19 @@ function layoutTextPages() {
   textPageTotal = Math.max(1, Math.round(textviewBody.scrollWidth / stride));
   pageCount = textPageTotal;
   seek.max = String(pageCount - 1);
-  computeTextPageOffsets(stride);
-  // 幅が変われば同じ文字位置でもページ番号が変わる。番号ではなく位置で戻す。
-  current = Math.min(pageCount - 1, textPageOfOffset(keepOffset));
-  recomputeBookmarkedPages(); // しおりの点灯も新しいページ番号で取り直す
+  if (remeasure) {
+    window.clearTimeout(textRemeasureTimer);
+    const keepOffset =
+      textHeldOffset ?? (textPageOffsets.length > 0 ? textOffsetOfPage(current) : 0);
+    textHeldOffset = null;
+    computeTextPageOffsets(stride);
+    // 幅が変われば同じ文字位置でもページ番号が変わる。番号ではなく位置で戻す。
+    current = Math.min(pageCount - 1, textPageOfOffset(keepOffset));
+    recomputeBookmarkedPages(); // しおりの点灯も新しいページ番号で取り直す
+  } else {
+    current = clampNum(current, 0, pageCount - 1);
+    scheduleTextRemeasure();
+  }
   showTextPage(current);
 }
 
@@ -1531,10 +1571,11 @@ function buildTextView() {
     ? renderMarkdown(textSource)
     : renderPlainText(textSource);
   textPageOffsets = [];
+  textHeldOffset = null;
   collectTextNodes(); // 文字位置を測るための下準備（本文自体は書き換えない）
   // 段組みは実際の描画幅が要るため、レイアウト確定後に計算する。
   layoutTextPages();
-  requestAnimationFrame(layoutTextPages);
+  requestAnimationFrame(() => layoutTextPages());
   flashBar();
 }
 
@@ -1585,6 +1626,16 @@ async function openTextFile(path: string, reset = false, seq = beginOpenRequest(
 /// 画像以外の表示要素を片付ける（画像・PDFの表示へ戻る時に呼ぶ）。
 function hideTextView() {
   textview.classList.add("hidden");
+  // 本文のDOMと文字位置の控えは、文庫1冊なら数十万文字ぶん残る。
+  // 画像へ移ったら手放す（軽快さを保つため）。ページ送りごとに呼ばれるので、
+  // 抱えている時だけ片付ける。
+  if (textCharTotal > 0 || textviewBody.firstChild) {
+    textviewBody.textContent = "";
+    textNodes = [];
+    textCharTotal = 0;
+    textPageOffsets = [];
+    textSource = "";
+  }
 }
 
 // ---- 同梱テキスト（アーカイブ／フォルダに含まれる説明書き等） ----
@@ -3072,21 +3123,28 @@ function assignKey(action: ActionId, binding: KeyBinding) {
 /// 固定文字で書いていると、割り当てを変えた後も古いキーを案内し続けるため。
 function refreshKeyLabels() {
   for (const el of document.querySelectorAll<HTMLElement>("[data-key-of]")) {
-    const id = el.dataset.keyOf as ActionId;
-    const b = keymap[id];
-    if (!b) continue;
-    const extra = el.dataset.keyExtra ? ` / ${el.dataset.keyExtra}` : "";
-    const inner = b.key ? formatKeyLabel(b) + extra : el.dataset.keyExtra || "";
-    const suffix = inner ? ` (${inner})` : "";
-    const titleBase = el.dataset.titleBase;
-    if (titleBase !== undefined) {
-      el.title = titleBase + suffix;
-      continue;
-    }
-    // 初回の文字列を基準として覚えておく（二度目以降に重ねて付けないため）。
-    if (el.dataset.labelBase === undefined) el.dataset.labelBase = el.textContent ?? "";
-    el.textContent = el.dataset.labelBase + suffix;
+    applyKeyLabel(el);
   }
+}
+
+/// 1つの要素にキー表記を反映する。
+function applyKeyLabel(el: HTMLElement) {
+  const id = el.dataset.keyOf as ActionId;
+  const b = keymap[id];
+  if (!b) return;
+  const extra = el.dataset.keyExtra ? ` / ${el.dataset.keyExtra}` : "";
+  const inner = b.key ? formatKeyLabel(b) + extra : el.dataset.keyExtra || "";
+  const suffix = inner ? ` (${inner})` : "";
+  const titleBase = el.dataset.titleBase;
+  if (titleBase !== undefined) {
+    const title = titleBase + suffix;
+    if (el.title !== title) el.title = title;
+    return;
+  }
+  // 初回の文字列を基準として覚えておく（二度目以降に重ねて付けないため）。
+  if (el.dataset.labelBase === undefined) el.dataset.labelBase = el.textContent ?? "";
+  const label = el.dataset.labelBase + suffix;
+  if (el.textContent !== label) el.textContent = label;
 }
 
 // ---- 表示設定メニュー（見開き・回転・フィット） ----
@@ -3453,9 +3511,12 @@ async function loadBookmarkedPages() {
 function updateBookmarkBtnUi() {
   const marked = currentAnchor !== null && pageCount > 0 && bookmarkedPages.has(current);
   bookmarkBtn.classList.toggle("marked", marked);
-  bookmarkBtn.title = marked
-    ? "このページのしおりを外すのだ (B)"
-    : "このページにしおりを挟むのだ (B)";
+  // 説明文だけ差し替え、キーの表記は refreshKeyLabels に任せる
+  // （ここで固定の「(B)」を書くと、割り当てを変えても古いキーを案内し続ける）。
+  bookmarkBtn.dataset.titleBase = marked
+    ? "このページのしおりを外す"
+    : "このページにしおりを挟む";
+  applyKeyLabel(bookmarkBtn); // ページ送りごとに呼ばれるので、このボタンだけ更新する
 }
 
 /// 今のページに対応する記録値。本文は、組み直しで文字位置が少しずれても
