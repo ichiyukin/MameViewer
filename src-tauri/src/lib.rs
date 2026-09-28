@@ -1315,7 +1315,9 @@ fn list_volumes_sync(anchor: &str) -> Result<Vec<String>, String> {
         let entry = entry.map_err(|e| e.to_string())?;
         let ep = entry.path();
         let s = ep.to_string_lossy().to_string();
-        if ep.is_dir() || is_archive_ext(&s) {
+        // PDF・テキストも「巻」として扱う。含めないと、同じフォルダに
+        // 並べた vol1.pdf / vol2.pdf の間を移動できず、◀◀ ▶▶ が無反応になる。
+        if ep.is_dir() || is_archive_ext(&s) || is_pdf(&s) || is_text(&s) {
             volumes.push(s);
         }
     }
@@ -1344,20 +1346,97 @@ pub const PROG_BYTES: u64 = 1;
 pub const PROG_ITEMS: u64 = 2;
 
 /// 計測を始める。total=0 は「総量が事前に分からない」＝実数だけ出す、の意味。
+/// 進捗表示を使ってよいのは「利用者が待っている1件」だけ。
+/// 先読みは最大4ページ分を同時に投げ、裏方のサムネイル生成も読み出しを行うため、
+/// 誰でも書けるようにすると、先に終わった1件が本命の進捗を消してしまう。
+static PROG_OWNER: AtomicU64 = AtomicU64::new(0);
+static PROG_NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// このスレッドが進捗の持ち主かどうか（持ち主だけが書き換えられる）。
+    static PROG_TOKEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// 進捗の持ち主になる。既に誰かが持っていれば譲らない（奪い合わない）。
+fn prog_claim() -> bool {
+    let id = PROG_NEXT_ID.fetch_add(1, AtomicOrd::Relaxed) + 1;
+    if PROG_OWNER
+        .compare_exchange(0, id, AtomicOrd::Relaxed, AtomicOrd::Relaxed)
+        .is_ok()
+    {
+        PROG_TOKEN.with(|t| t.set(id));
+        true
+    } else {
+        PROG_TOKEN.with(|t| t.set(0));
+        false
+    }
+}
+
+/// 進捗表示の持ち主であることを表す札。スコープを抜けると自動で降りるため、
+/// 途中で `?` により返っても表示が出しっぱなしにならない。
+struct ProgGuard {
+    owned: bool,
+}
+
+impl ProgGuard {
+    /// 利用者が待っている処理の先頭で作る。既に誰かが表示中なら持ち主にはならない。
+    fn claim() -> Self {
+        ProgGuard {
+            owned: prog_claim(),
+        }
+    }
+}
+
+impl Drop for ProgGuard {
+    fn drop(&mut self) {
+        if self.owned {
+            prog_release();
+        }
+    }
+}
+
+fn prog_owned() -> bool {
+    let id = PROG_TOKEN.with(|t| t.get());
+    id != 0 && PROG_OWNER.load(AtomicOrd::Relaxed) == id
+}
+
+/// 持ち主を降りる（必ず呼ぶ。降り損ねると以後の進捗が出なくなる）。
+fn prog_release() {
+    let id = PROG_TOKEN.with(|t| t.get());
+    if id != 0 {
+        let _ = PROG_OWNER.compare_exchange(id, 0, AtomicOrd::Relaxed, AtomicOrd::Relaxed);
+        PROG_TOKEN.with(|t| t.set(0));
+    }
+    prog_clear();
+}
+
+fn prog_clear() {
+    READ_UNIT.store(0, AtomicOrd::Relaxed);
+    READ_TOTAL.store(0, AtomicOrd::Relaxed);
+    READ_DONE.store(0, AtomicOrd::Relaxed);
+}
+
 fn prog_begin(unit: u64, total: u64) {
+    if !prog_owned() {
+        return;
+    }
     READ_DONE.store(0, AtomicOrd::Relaxed);
     READ_TOTAL.store(total, AtomicOrd::Relaxed);
     READ_UNIT.store(unit, AtomicOrd::Relaxed);
 }
 
 fn prog_add(n: u64) {
+    if !prog_owned() {
+        return;
+    }
     READ_DONE.fetch_add(n, AtomicOrd::Relaxed);
 }
 
 fn prog_end() {
-    READ_UNIT.store(0, AtomicOrd::Relaxed);
-    READ_TOTAL.store(0, AtomicOrd::Relaxed);
-    READ_DONE.store(0, AtomicOrd::Relaxed);
+    if !prog_owned() {
+        return;
+    }
+    prog_clear();
 }
 
 /// 大きな段取りの進み具合（例：内部アーカイブ 3/10 個目）。
@@ -1419,7 +1498,10 @@ fn get_read_progress() -> ReadProgress {
 /// 少しずつ読みながら、読めた量を報告する。
 /// read_to_end に任せると完了まで何も分からないため、自前で区切って読む。
 fn read_all_counting<R: Read>(mut src: R, expected: u64) -> std::io::Result<Vec<u8>> {
-    let mut buf = Vec::with_capacity(expected as usize);
+    // expected はアーカイブの自己申告値。壊れたファイルが巨大値を名乗ると、
+    // 確保の失敗はパニックではなくプロセス即死になるため、上限で抑える。
+    const PREALLOC_CAP: u64 = 64 * 1024 * 1024;
+    let mut buf = Vec::with_capacity(expected.min(PREALLOC_CAP) as usize);
     let mut chunk = [0u8; 64 * 1024];
     loop {
         let n = src.read(&mut chunk)?;
@@ -2071,6 +2153,8 @@ async fn open_archive(path: String, reset: bool, seq: u64) -> Result<OpenResult,
     let my_seq = seq;
     OPEN_SEQ.fetch_max(my_seq, AtomicOrd::Relaxed);
     tauri::async_runtime::spawn_blocking(move || {
+        // 本を開く処理は最も待たされる。進捗表示はこの処理が優先して持つ。
+        let _prog = ProgGuard::claim();
         let format = detect_format(&path)?;
         let keep = short_hash(&path); // この本の一時ファイルを見分ける印
         let entries = build_sorted_entries(&path, format)?;
@@ -2219,6 +2303,7 @@ async fn open_folder(
     let my_seq = seq;
     OPEN_SEQ.fetch_max(my_seq, AtomicOrd::Relaxed);
     tauri::async_runtime::spawn_blocking(move || {
+        let _prog = ProgGuard::claim();
         let p = PathBuf::from(&path);
         let focus = if p.is_dir() { None } else { Some(p.clone()) };
         let dir = resolve_base_dir(&p)?;
@@ -2284,8 +2369,13 @@ async fn open_folder(
 
 /// 指定ページの画像バイト列を返す（別スレッドで実行しUIを塞がない）。
 #[tauri::command]
-async fn get_page(index: usize) -> Result<tauri::ipc::Response, String> {
-    let bytes = tauri::async_runtime::spawn_blocking(move || read_page_bytes(index))
+async fn get_page(index: usize, quiet: bool) -> Result<tauri::ipc::Response, String> {
+    let bytes = tauri::async_runtime::spawn_blocking(move || {
+        // 先読み（quiet）は利用者が待っていないので進捗表示を触らせない。
+        // 触らせると、本命のページの表示が先読みの完了で消えてしまう。
+        let _prog = if quiet { None } else { Some(ProgGuard::claim()) };
+        read_page_bytes(index)
+    })
         .await
         .map_err(|e| e.to_string())??;
     // IPCへ渡す時だけ所有権のあるVecが要る。他の呼び出し側は共有参照のまま扱う。
@@ -2605,7 +2695,9 @@ mod tests {
         assert!(detect_format("d.txt").is_err());
     }
 
-    /// 巻移動：同フォルダ内のアーカイブファイル・サブフォルダが自然順で列挙されること。
+    /// 巻移動：同フォルダ内の「開けるもの」が自然順で列挙されること。
+    /// テキストやPDFも表示できるようになったので巻として数える（数えないと、
+    /// 小説やPDFだけを集めたフォルダで巻移動が一切効かなくなる）。
     #[test]
     fn list_volumes_finds_archives_and_folders() {
         let base = std::env::temp_dir().join("mviewer_volumes_test");
@@ -2613,14 +2705,16 @@ mod tests {
         std::fs::create_dir_all(base.join("Chapter2_unpacked")).unwrap();
         std::fs::write(base.join("Chapter1.zip"), b"fake").unwrap();
         std::fs::write(base.join("Chapter3.cbz"), b"fake").unwrap();
-        std::fs::write(base.join("readme.txt"), b"not a volume").unwrap();
+        std::fs::write(base.join("Chapter4.txt"), b"text volume").unwrap();
+        std::fs::write(base.join("cover.jpg"), b"fake").unwrap();
 
         let anchor = base.join("Chapter1.zip");
         let volumes = list_volumes_sync(anchor.to_str().unwrap()).expect("巻一覧の取得");
-        assert_eq!(volumes.len(), 3, "readme.txtは巻として数えない");
+        assert_eq!(volumes.len(), 4, "単体の画像は巻として数えない");
         assert!(volumes[0].ends_with("Chapter1.zip"));
         assert!(volumes[1].ends_with("Chapter2_unpacked"));
         assert!(volumes[2].ends_with("Chapter3.cbz"));
+        assert!(volumes[3].ends_with("Chapter4.txt"));
 
         let _ = std::fs::remove_dir_all(&base);
     }

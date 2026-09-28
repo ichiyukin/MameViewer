@@ -528,7 +528,13 @@ function evict() {
 }
 
 // ページのobjectURLを取得（キャッシュ優先、無ければ読み込み）。
-async function getPageUrl(index: number): Promise<string> {
+// 取得している間に別の本へ切り替わった時に投げる印。表示側は黙って諦める。
+const PAGE_STALE = "__stale_page__";
+function isStalePage(e: unknown): boolean {
+  return String(e).includes(PAGE_STALE);
+}
+
+async function getPageUrl(index: number, quiet = false): Promise<string> {
   const hit = pageCache.get(index);
   if (hit !== undefined) {
     touch(index);
@@ -542,7 +548,7 @@ async function getPageUrl(index: number): Promise<string> {
         const blob = await renderPdfPage(index);
         return { url: URL.createObjectURL(blob), size: blob.size };
       }
-      const buf = await invoke<ArrayBuffer>("get_page", { index });
+      const buf = await invoke<ArrayBuffer>("get_page", { index, quiet });
       return { url: URL.createObjectURL(new Blob([buf])), size: buf.byteLength };
     })();
     p = fetchP;
@@ -559,8 +565,9 @@ async function getPageUrl(index: number): Promise<string> {
   const { url, size } = await p;
   if (gen !== archiveGen) {
     // 取得中に別アーカイブへ切り替わっていた。キャッシュを汚さないよう破棄。
+    // 解放済みのURLは表示に使えないので、返さずに諦めたことを伝える。
     URL.revokeObjectURL(url);
-    return url;
+    throw new Error(PAGE_STALE);
   }
   if (!pageCache.has(index)) {
     pageCache.set(index, url);
@@ -643,7 +650,7 @@ async function predecode(index: number) {
   if (index < 0 || index >= pageCount || predecoded.has(index)) return;
   const gen = archiveGen;
   try {
-    const url = await getPageUrl(index);
+    const url = await getPageUrl(index, true);
     if (gen !== archiveGen) return;
     const im = new Image();
     im.src = url;
@@ -667,7 +674,7 @@ function runPrefetch() {
   for (let d = 1; d <= PRELOAD_BEHIND; d++) targets.push(current - d);
   for (const t of targets) {
     if (t >= 0 && t < pageCount && !pageCache.has(t)) {
-      getPageUrl(t).catch(() => {}); // 先読み失敗は無視
+      getPageUrl(t, true).catch(() => {}); // 先読み失敗は無視
     }
   }
   // 直後に見るページ（見開き時はその次の組）だけデコードまで先に済ませる。
@@ -692,6 +699,10 @@ function prefetch() {
 }
 
 function resetPageCache() {
+  // 見開き用の2枚は src を指したままだと、URLを解放しても実体が残る。
+  // 別の本へ移った後もセッション中ずっと保持され、設定した上限を超える。
+  pageLeftEl.removeAttribute("src");
+  pageRightEl.removeAttribute("src");
   for (const url of pageCache.values()) URL.revokeObjectURL(url);
   pageCache.clear();
   pageBytes.clear();
@@ -859,6 +870,9 @@ async function updateNavigatorThumb() {
     );
     updateNavigatorViewportRect();
   } catch (e) {
+    // 先に印を付けてしまっているので戻す。戻さないと、このページに対しては
+    // 二度と取り直さず、ミニマップが前のページの絵を映したままになる。
+    navThumbKey = "";
     console.error("ナビゲーター用サムネイル取得失敗:", e);
   }
 }
@@ -927,6 +941,15 @@ window.addEventListener("mouseup", () => {
 // 分岐すると、その間のリサイズ／フィット変更が非表示の見開き側だけ再計算して
 // 表示中の単ページ画像を古いサイズのまま放置してしまう。
 function applyLayout() {
+  // 本文表示中は画像の寸法（natW/natH）が前の本のまま残っている。
+  // そのまま計算すると、ナビゲーターが本文の上に出たり、
+  // canPan() が真になって本文の文字が選択できなくなる。
+  if (pageSource === "text") {
+    dispW = 0;
+    dispH = 0;
+    updateNavigatorVisibility();
+    return;
+  }
   if (!spread.classList.contains("hidden")) applyLayoutSpread();
   else applyLayoutSingle();
 }
@@ -1047,6 +1070,9 @@ async function renderSingle() {
   const idx = current;
   const gen = archiveGen;
   spread.classList.add("hidden");
+  // 隠した時点で単ページ。デコード失敗などで途中で抜けても2のまま残さない
+  // （残るとページ送りが2つずつ進み、1ページ飛ばしになる）。
+  shownCount = 1;
   // ズーム倍率はページ移動では維持する（表示位置のみ中央へ戻す）。
   panX = 0;
   panY = 0;
@@ -1087,7 +1113,7 @@ async function renderSingle() {
     updateNavigatorThumb();
     updateBookmarkBtnUi();
   } catch (e) {
-    console.error("ページ取得失敗:", e);
+    if (!isStalePage(e)) console.error("ページ取得失敗:", e);
   }
 }
 
@@ -1152,7 +1178,7 @@ async function renderSpread() {
     updateNavigatorThumb();
     updateBookmarkBtnUi();
   } catch (e) {
-    console.error("見開きページ取得失敗:", e);
+    if (!isStalePage(e)) console.error("見開きページ取得失敗:", e);
   }
 }
 
@@ -1330,6 +1356,7 @@ async function openTextFile(path: string, reset = false, seq = beginOpenRequest(
     buildTextView();
     if (!reset) {
       const h = await invoke<{ positions: Record<string, number> }>("get_history");
+      if (!isCurrentOpen(seq)) return; // 待っている間に別のファイルが開かれた
       const saved = Math.min(h.positions[path] ?? 0, Math.max(0, pageCount - 1));
       if (saved > 0) {
         current = saved;
@@ -1804,7 +1831,12 @@ async function toggleTreeNode(path: string) {
 }
 
 // 「場所」一覧を表示する（ドライブ直下からさらに上へ辿った時の行き先）。
+// 「場所」一覧の表示回数。取得を待つ間にもう一度開かれた場合、
+// 古い方の結果を書き足さないために使う（放置すると項目が二重に並ぶ）。
+let placesSeq = 0;
+
 async function showPlaces() {
+  const mySeq = ++placesSeq;
   pushTreeHistory({ kind: "places" });
   treeAtPlaces = true;
   treeRootDir = null;
@@ -1816,7 +1848,7 @@ async function showPlaces() {
   treeScrollEl.appendChild(buildPathInputRow());
   try {
     const places = await invoke<PlaceEntry[]>("list_places");
-    if (!treeAtPlaces) return; // 取得中に別の場所へ移っていた
+    if (!treeAtPlaces || mySeq !== placesSeq) return; // 取得中に移動または再表示された
 
     // お気に入りはツリー下部に常設しているので、ここには重ねて出さない。
     const drives = places.filter((p) => p.kind.startsWith("drive-"));
@@ -2311,6 +2343,7 @@ async function openPdf(path: string, reset = false, seq = beginOpenRequest()) {
     let initial = 0;
     if (!reset) {
       const h = await invoke<{ positions: Record<string, number> }>("get_history");
+      if (!isCurrentOpen(seq)) return; // 待っている間に別のファイルが開かれた
       initial = Math.min(h.positions[path] ?? 0, Math.max(0, pageCount - 1));
     }
     current = initial;
@@ -2466,22 +2499,32 @@ function endOpening(seq: number) {
 // サブフォルダ）を自然順で前後に辿る。端に達していれば何もしない。
 // landAtEnd=true の場合、移動先の巻を開いた後に最終ページへジャンプする
 // （ページ末端に達したことで自動的に前の巻へ遡る場合に、続きから自然に読めるように）。
+// 巻移動が重ならないようにする。端で連打すると複数の移動が同時に走り、
+// 最後に開いた本とは別の本の末尾を指してしまう。
+let volumeMoving = false;
+
 async function goVolume(dir: 1 | -1, landAtEnd = false) {
-  if (!currentAnchor) return;
+  if (!currentAnchor || volumeMoving) return;
+  volumeMoving = true;
   try {
     const volumes = await invoke<string[]>("list_volumes", { anchor: currentAnchor });
     const idx = volumes.indexOf(currentAnchor);
     if (idx < 0) return;
     const nextIdx = idx + dir;
     if (nextIdx < 0 || nextIdx >= volumes.length) return;
-    await openPath(volumes[nextIdx]);
-    if (landAtEnd && pageCount > 0) {
+    const target = volumes[nextIdx];
+    await openPath(target);
+    // 開けたかを確かめる。失敗しても openPath は例外を投げないため、
+    // 確認せずに進めると「読んでいた本」が最終ページへ飛んでしまう。
+    if (landAtEnd && currentAnchor === target && pageCount > 0) {
       current = pageCount - 1;
       schedulePositionSave();
       render();
     }
   } catch (e) {
     console.error("巻移動に失敗:", e);
+  } finally {
+    volumeMoving = false;
   }
 }
 
@@ -2760,6 +2803,7 @@ document
 // ---- 回転・フィットモード・綴じ方向・見開き ----
 function cycleRotation() {
   rotation = (rotation + 90) % 360;
+  resetZoom(); // フィット変更・見開き切替と挙動を揃える
   localStorage.setItem("rotation", String(rotation));
   panX = 0;
   panY = 0;
@@ -3185,6 +3229,8 @@ async function jumpToBookmark(bm: BookmarkView) {
   closeBookmarks();
   if (bm.anchor !== currentAnchor) {
     await openPath(bm.anchor);
+    // 開けなかった場合にそのまま進めると、読んでいた本が別のページへ飛ぶ。
+    if (currentAnchor !== bm.anchor) return;
   }
   jump(bm.page);
 }
