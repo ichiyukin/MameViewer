@@ -3554,8 +3554,8 @@ function updateBookmarkBtnUi() {
   // 説明文だけ差し替え、キーの表記は refreshKeyLabels に任せる
   // （ここで固定の「(B)」を書くと、割り当てを変えても古いキーを案内し続ける）。
   bookmarkBtn.dataset.titleBase = marked
-    ? "このページのしおりを外す"
-    : "このページにしおりを挟む";
+    ? "このページのしおりを外すのだ"
+    : "このページにしおりを挟むのだ";
   applyKeyLabel(bookmarkBtn); // ページ送りごとに呼ばれるので、このボタンだけ更新する
 }
 
