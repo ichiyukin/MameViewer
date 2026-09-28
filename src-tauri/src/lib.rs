@@ -1081,7 +1081,7 @@ fn read_zip_entry_bytes(bytes: &[u8], name: &str) -> Result<Vec<u8>, String> {
     let mut zip =
         zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| format!("Zipを読めません: {e}"))?;
     let mut entry = zip.by_name(name).map_err(|e| e.to_string())?;
-    let mut buf = Vec::with_capacity(entry.size() as usize);
+    let mut buf = prealloc_for(entry.size());
     entry.read_to_end(&mut buf).map_err(|e| e.to_string())?;
     Ok(buf)
 }
@@ -1629,11 +1629,16 @@ fn get_read_progress() -> ReadProgress {
 
 /// 少しずつ読みながら、読めた量を報告する。
 /// read_to_end に任せると完了まで何も分からないため、自前で区切って読む。
-fn read_all_counting<R: Read>(mut src: R, expected: u64) -> std::io::Result<Vec<u8>> {
-    // expected はアーカイブの自己申告値。壊れたファイルが巨大値を名乗ると、
-    // 確保の失敗はパニックではなくプロセス即死になるため、上限で抑える。
+/// アーカイブが申告するサイズで先に確保しておく（再確保を減らすため）。
+/// ただし申告値は信用できない。壊れたファイルが巨大値を名乗ると、確保の失敗は
+/// パニックではなくプロセス即死になるため、上限で抑える（超える分は読みながら伸ばす）。
+fn prealloc_for(declared: u64) -> Vec<u8> {
     const PREALLOC_CAP: u64 = 64 * 1024 * 1024;
-    let mut buf = Vec::with_capacity(expected.min(PREALLOC_CAP) as usize);
+    Vec::with_capacity(declared.min(PREALLOC_CAP) as usize)
+}
+
+fn read_all_counting<R: Read>(mut src: R, expected: u64) -> std::io::Result<Vec<u8>> {
+    let mut buf = prealloc_for(expected);
     let mut chunk = [0u8; 64 * 1024];
     loop {
         let n = src.read(&mut chunk)?;
@@ -2052,7 +2057,7 @@ fn pregen_thumbnails(gen: u64) {
                                 continue;
                             }
                             if let Ok(mut e) = zip.by_name(&entry.name) {
-                                let mut buf = Vec::with_capacity(e.size() as usize);
+                                let mut buf = prealloc_for(e.size());
                                 if e.read_to_end(&mut buf).is_ok()
                                     && !send_cancellable(&tx, (idx, buf))
                                 {
@@ -2210,7 +2215,7 @@ fn pregen_thumbnails(gen: u64) {
                                     break;
                                 }
                                 if let Ok(mut e) = zip.by_name(name) {
-                                    let mut buf = Vec::with_capacity(e.size() as usize);
+                                    let mut buf = prealloc_for(e.size());
                                     if e.read_to_end(&mut buf).is_ok()
                                         && !send_cancellable(&tx, (*idx, buf))
                                     {
@@ -2531,6 +2536,23 @@ async fn get_page(index: usize, quiet: bool) -> Result<tauri::ipc::Response, Str
 /// テキストの生バイト列を文字列へ復号する。
 /// 日本語のテキストはUTF-8とShift-JISが混在しており、決め打ちで復号すると
 /// 古いファイルが文字化けするため、内容から符号化方式を推定してから復号する。
+/// 本文として開けるテキストの上限。これを超えるものは読み込む前に断る。
+/// 本文は段組みで1画面ずつ組むため、極端に大きいと組版だけで数秒～数十秒
+/// 固まる（20万文字で初回の組版が約0.1秒。文庫で数冊分の分量までが実用域）。
+/// 誤ってログ等の巨大ファイルを開いた時に、アプリごと固まるのを防ぐ。
+const TEXT_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+fn check_text_size(len: u64) -> Result<(), String> {
+    if len > TEXT_MAX_BYTES {
+        return Err(format!(
+            "テキストが大きすぎるため開けません（{:.1}MB）。{}MBまで対応しています。",
+            len as f64 / 1024.0 / 1024.0,
+            TEXT_MAX_BYTES / 1024 / 1024
+        ));
+    }
+    Ok(())
+}
+
 fn decode_text(raw: &[u8]) -> String {
     // BOM付きならそれが最も確実な手掛かりになるので優先する。
     if let Some(stripped) = raw.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
@@ -2594,10 +2616,15 @@ async fn read_archive_text(name: String) -> Result<String, String> {
             (st.path.clone(), st.format)
         };
         let raw = if format == Format::Folder {
-            std::fs::read(Path::new(&path).join(&name)).map_err(|e| e.to_string())?
+            let file = Path::new(&path).join(&name);
+            let len = std::fs::metadata(&file).map_err(|e| e.to_string())?.len();
+            check_text_size(len)?;
+            std::fs::read(&file).map_err(|e| e.to_string())?
         } else {
             read_entry_from(&path, format, &name)?
         };
+        // アーカイブ内は展開してみないと大きさが確実でないので、展開後に確かめる。
+        check_text_size(raw.len() as u64)?;
         Ok(decode_text(&raw))
     })
     .await
@@ -2608,6 +2635,11 @@ async fn read_archive_text(name: String) -> Result<String, String> {
 #[tauri::command]
 async fn read_text_file(path: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        // 読み込む前に大きさを確かめる（読んでから断ると、その間に固まる）。
+        let len = std::fs::metadata(&path)
+            .map_err(|e| format!("ファイルを読めません: {e}"))?
+            .len();
+        check_text_size(len)?;
         let raw = std::fs::read(&path).map_err(|e| format!("ファイルを読めません: {e}"))?;
         Ok(decode_text(&raw))
     })
@@ -2770,8 +2802,18 @@ pub fn run() {
             list_archive_texts,
             read_archive_text
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app, event| {
+            // 終了時に、このプロセスの一時フォルダ（入れ子Rarの展開先）を片付ける。
+            // 片付けないと、最後に読んでいた本の展開分（数百MBになり得る）が
+            // 次回起動の掃除（1日以上経過したものだけが対象）まで残り続ける。
+            if let tauri::RunEvent::Exit = event {
+                if let Ok(dir) = nested_temp_dir() {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+            }
+        });
 }
 
 #[cfg(test)]

@@ -3,6 +3,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import { open as openDialog, ask } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { openUrl } from "@tauri-apps/plugin-opener";
 
 const ARCHIVE_EXTS = ["zip", "cbz", "rar", "cbr", "7z", "cb7"];
 const IMAGE_EXTS = ["jpg", "jpeg", "png", "webp", "gif", "avif", "bmp"];
@@ -1646,6 +1647,23 @@ const textsReader = document.querySelector<HTMLDivElement>("#texts-reader")!;
 // 本文の差し込み先は内側の入れ物。#texts-reader 自体へ書くと入れ物ごと消える。
 const textsReaderBody = document.querySelector<HTMLDivElement>("#texts-reader-body")!;
 let textsReadSeq = 0;
+
+// 本文・同梱テキスト中のリンク。既定の動作に任せると、クリックがページ送りにも
+// 使われたうえで、アプリの中に枠だけのブラウザ窓が開いてしまう。
+// 既定のブラウザで開き、ページ送りには使わない。
+function handleTextLinkClick(e: MouseEvent) {
+  const a = (e.target as HTMLElement | null)?.closest?.("a[href]") as HTMLAnchorElement | null;
+  if (!a) return;
+  e.preventDefault();
+  e.stopPropagation(); // 画面全体の click（ページ送り）へ届かせない
+  const href = a.getAttribute("href") ?? "";
+  // 組み立て時に http/https だけを通しているが、念のためここでも確かめる。
+  if (/^https?:\/\//i.test(href)) {
+    openUrl(href).catch((err) => console.error("リンクを開けませんでした:", err));
+  }
+}
+textviewBody.addEventListener("click", handleTextLinkClick);
+textsReaderBody.addEventListener("click", handleTextLinkClick);
 let textsOpen = false;
 
 async function openTextsPanel() {
@@ -3950,6 +3968,13 @@ window.addEventListener("click", (e) => {
   }
   if (gridOpen || bmOpen || helpOpen || keybindOpen || aboutOpen || textsOpen) return;
   if (pressedOnUi || onUi(e)) return; // パネル上で押した場合はページ送りに使わない
+  // 本文をドラッグして文字を選んだ直後の click はページ送りに使わない。
+  // 送ってしまうと選んだ範囲ごと次のページへ流れ、コピーできない。
+  // （普通のクリックは押した瞬間に選択が畳まれるので、ここには掛からない）
+  if (pageSource === "text") {
+    const sel = window.getSelection();
+    if (sel && !sel.isCollapsed && sel.toString().length > 0) return;
+  }
   if (!menu.classList.contains("hidden")) {
     toggleMenu(false); // メニュー表示中の画面クリックは閉じるだけ
     return;
