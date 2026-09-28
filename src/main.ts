@@ -447,7 +447,9 @@ function startProgressPolling() {
 // サムネイル1枚分のデータを取得する。PDFはRust側にページが無いので、
 // pdf.jsで描いたページ画像をそのままサムネイルとして使う。
 async function fetchThumbBlob(index: number): Promise<Blob> {
-  if (pageSource === "pdf") return await renderPdfPage(index);
+  // サムネイルを原寸2倍で描くと、一覧を開いただけで全ページ分の大きな画像を
+  // 作ってしまう。Rust側のサムネイル（長辺360px）と同じ大きさに合わせる。
+  if (pageSource === "pdf") return await renderPdfPage(index, THUMB_LONG_EDGE);
   const buf = await invoke<ArrayBuffer>("get_thumbnail", { index });
   return new Blob([buf]);
 }
@@ -461,6 +463,15 @@ type PdfDoc = {
 /// 破棄はドキュメントではなく読み込みタスク側が持つ（版によって場所が違うため保持しておく）。
 type PdfLoadingTask = { promise: Promise<unknown>; destroy: () => Promise<void> };
 let pdfLoadingTask: PdfLoadingTask | null = null;
+
+/// 開いているPDFを解放する。PDF以外を開いた時に呼ばないと、
+/// pdf.jsのワーカーとPDF全体のバッファがセッション中ずっと残る。
+async function releasePdf() {
+  const task = pdfLoadingTask;
+  pdfLoadingTask = null;
+  pdfDoc = null;
+  if (task) await task.destroy().catch(() => {});
+}
 type PdfPage = {
   getViewport: (o: { scale: number }) => { width: number; height: number };
   render: (o: {
@@ -472,6 +483,16 @@ type PdfPage = {
 let pdfDoc: PdfDoc | null = null;
 // 原寸の何倍で描画するか。1.0だと画面上で拡大した時に粗くなるため、少し余裕を持たせる。
 const PDF_RENDER_SCALE = 2.0;
+/// サムネイルの長辺（px）。Rust側の THUMB_MAX と揃える。
+const THUMB_LONG_EDGE = 360;
+
+/// 長辺を maxLongEdge に収める描画倍率（原寸の2倍を上限とする）。
+function pdfScaleFor(page: PdfPage, maxLongEdge?: number): number {
+  if (!maxLongEdge) return PDF_RENDER_SCALE;
+  const base = page.getViewport({ scale: 1 });
+  const long = Math.max(base.width, base.height) || 1;
+  return Math.min(PDF_RENDER_SCALE, maxLongEdge / long);
+}
 
 async function loadPdfLib() {
   const lib = await import("pdfjs-dist");
@@ -488,10 +509,10 @@ async function pdfPageDims(index: number): Promise<{ w: number; h: number; anima
   return { w: Math.round(vp.width), h: Math.round(vp.height), animated: false };
 }
 
-async function renderPdfPage(index: number): Promise<Blob> {
+async function renderPdfPage(index: number, maxLongEdge?: number): Promise<Blob> {
   if (!pdfDoc) throw new Error("PDFが開かれていません");
   const page = await pdfDoc.getPage(index + 1);
-  const viewport = page.getViewport({ scale: PDF_RENDER_SCALE });
+  const viewport = page.getViewport({ scale: pdfScaleFor(page, maxLongEdge) });
   const canvas = document.createElement("canvas");
   canvas.width = Math.max(1, Math.round(viewport.width));
   canvas.height = Math.max(1, Math.round(viewport.height));
@@ -1403,6 +1424,7 @@ async function openTextFile(path: string, reset = false, seq = beginOpenRequest(
     if (!isCurrentOpen(seq)) return; // 読み込み中に別のファイルが開かれた
     textSource = body;
     textIsMarkdown = extOf(path) === "md";
+    releasePdf(); // PDF以外へ移るのでワーカーとバッファを解放する
     pageSource = "text";
     archiveGen++;
     resetPageCache();
@@ -1620,7 +1642,9 @@ function handleEndReached(dir: number) {
     schedulePositionSave();
     render();
   } else {
-    goNextVolume();
+    // 読み進めて次の巻へ渡る時は1ページ目から。記憶した位置（途中）から
+    // 始まると、遡る側が最終ページに着くのと釣り合わず、読み飛ばしになる。
+    goVolume(1, false, true);
   }
 }
 
@@ -2320,6 +2344,7 @@ async function openArchive(path: string, reset = false, seq = beginOpenRequest()
     });
     if (!isCurrentOpen(seq)) return; // 読み込み中に別のファイルが開かれた
     archiveGen++;
+    releasePdf(); // PDF以外へ移るのでワーカーとバッファを解放する
     pageSource = "archive";
     resetPageCache();
     pageCount = res.count;
@@ -2364,6 +2389,7 @@ async function openImageOrFolder(path: string, reset = false, seq = beginOpenReq
     );
     if (!isCurrentOpen(seq)) return; // 読み込み中に別のファイルが開かれた
     archiveGen++;
+    releasePdf(); // PDF以外へ移るのでワーカーとバッファを解放する
     pageSource = "archive";
     resetPageCache();
     pageCount = res.count;
@@ -2430,7 +2456,7 @@ async function openPdf(path: string, reset = false, seq = beginOpenRequest()) {
       return;
     }
     // 前のPDFの読み込みタスクを片付けてから差し替える（ワーカーを残さないため）。
-    if (pdfLoadingTask) await pdfLoadingTask.destroy().catch(() => {});
+    await releasePdf();
     pdfLoadingTask = task;
     pdfDoc = doc;
     pageSource = "pdf";
@@ -2604,7 +2630,10 @@ function endOpening(seq: number) {
 // 最後に開いた本とは別の本の末尾を指してしまう。
 let volumeMoving = false;
 
-async function goVolume(dir: 1 | -1, landAtEnd = false) {
+/// dir=1 で次の巻、-1 で前の巻へ。
+/// landAtEnd=true なら移動先の最終ページへ（遡って読み続ける時）。
+/// fromStart=true なら移動先を1ページ目から開く（読み進めて次の巻へ渡る時）。
+async function goVolume(dir: 1 | -1, landAtEnd = false, fromStart = false) {
   if (!currentAnchor || volumeMoving) return;
   volumeMoving = true;
   try {
@@ -2614,7 +2643,7 @@ async function goVolume(dir: 1 | -1, landAtEnd = false) {
     const nextIdx = idx + dir;
     if (nextIdx < 0 || nextIdx >= volumes.length) return;
     const target = volumes[nextIdx];
-    await openPath(target);
+    await openPath(target, fromStart);
     // 開けたかを確かめる。失敗しても openPath は例外を投げないため、
     // 確認せずに進めると「読んでいた本」が最終ページへ飛んでしまう。
     if (landAtEnd && currentAnchor === target && pageCount > 0) {
@@ -3075,6 +3104,19 @@ initCacheSettingsUi();
 // ---- サムネイル一覧 ----
 function setThumbSize(px: number) {
   gridScroll.style.setProperty("--thumb", px + "px");
+  // 見開き・綴じ方向・回転と同じく、次の起動でも同じ大きさで開けるようにする。
+  localStorage.setItem("thumbSize", String(px));
+}
+
+// 前回の大きさを復元する（スライダーの初期値にも反映する）。
+{
+  const saved = Number(localStorage.getItem("thumbSize"));
+  if (saved) {
+    const min = Number(thumbSize.min);
+    const max = Number(thumbSize.max);
+    thumbSize.value = String(clampNum(saved, min, max));
+  }
+  setThumbSize(Number(thumbSize.value));
 }
 
 function adjustThumb(delta: number) {

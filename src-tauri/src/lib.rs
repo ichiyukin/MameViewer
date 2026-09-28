@@ -312,7 +312,10 @@ async fn get_page_resized(index: usize, width: u32, height: u32) -> Result<tauri
         // デコード・リサイズの間に別アーカイブへ切り替わっていた場合はキャッシュへ書き込まない
         // （サムネイルキャッシュと同じ、切替時の混入を防ぐ世代ガード）。
         if THUMB_GEN.load(AtomicOrd::Relaxed) == gen {
-            RESIZED_CACHE.lock().unwrap().insert(key, Arc::new(bytes.clone()));
+            // 複製はロックを取る前に済ませる。数MBの複製をロック中に行うと、
+            // その間ほかのページ取得まで待たされる。
+            let cached = Arc::new(bytes.clone());
+            RESIZED_CACHE.lock().unwrap().insert(key, cached);
         }
         Ok(tauri::ipc::Response::new(bytes))
     })
@@ -749,22 +752,38 @@ async fn add_path_to_shelf(path: String) -> Result<(), String> {
             let first = std::fs::read(&entries[0]).map_err(|e| e.to_string())?;
             (dir.to_string_lossy().to_string(), first)
         } else {
-            // アーカイブ：中身を走査して先頭ページを表紙にする。
+            // アーカイブ：表紙は1枚あればよい。まず直下の画像だけを見る。
+            // 全ページの構築（build_sorted_entries）は内部のアーカイブを
+            // すべて展開する＝表紙1枚のために長く待たされ、一時ファイルと
+            // メモリも余分に使う。読んでいる本には関係のない処理なので避ける。
             let format = detect_format(&path)?;
-            let entries = build_sorted_entries(&path, format)?;
-            let first = entries.first().ok_or("画像が見つかりませんでした")?;
-            let raw = match &first.container {
-                None => read_entry_from(&p, format, &first.name)?,
-                Some(inner) => {
-                    // 入れ子アーカイブの中が先頭の場合。
-                    if let Some(tp) = &inner.temp_path {
-                        read_rar_entry(tp, &first.name)?
-                    } else {
-                        let bytes = get_inner_bytes(&p, format, inner)?;
-                        match inner.format {
-                            Format::Zip => read_zip_entry_bytes(&bytes, &first.name)?,
-                            Format::SevenZ => read_7z_entry_bytes(&bytes, &first.name)?,
-                            _ => return Err("対応していない内部アーカイブ形式です".into()),
+            let names = match format {
+                Format::Zip => list_zip(&path)?,
+                Format::Rar => list_rar(&path)?,
+                Format::SevenZ => list_7z(&path)?,
+                Format::Folder => unreachable!("detect_format は Folder を返さない"),
+            };
+            let mut direct: Vec<String> = names.into_iter().filter(|n| is_image(n)).collect();
+            direct.sort_by(|a, b| natural_cmp(a, b));
+            let raw = if let Some(first) = direct.first() {
+                read_entry_from(&p, format, first)?
+            } else {
+                // 直下に画像が無い（中身が入れ子アーカイブだけ）場合に限り、
+                // 全ページを構築して先頭を取る。
+                let entries = build_sorted_entries(&path, format)?;
+                let first = entries.first().ok_or("画像が見つかりませんでした")?;
+                match &first.container {
+                    None => read_entry_from(&p, format, &first.name)?,
+                    Some(inner) => {
+                        if let Some(tp) = &inner.temp_path {
+                            read_rar_entry(tp, &first.name)?
+                        } else {
+                            let bytes = get_inner_bytes(&p, format, inner)?;
+                            match inner.format {
+                                Format::Zip => read_zip_entry_bytes(&bytes, &first.name)?,
+                                Format::SevenZ => read_7z_entry_bytes(&bytes, &first.name)?,
+                                _ => return Err("対応していない内部アーカイブ形式です".into()),
+                            }
                         }
                     }
                 }
@@ -947,9 +966,12 @@ fn natural_cmp(a: &str, b: &str) -> Ordering {
                             break;
                         }
                     }
-                    let va: u128 = na.trim_start_matches('0').parse().unwrap_or(0);
-                    let vb: u128 = nb.trim_start_matches('0').parse().unwrap_or(0);
-                    match va.cmp(&vb) {
+                    // 数値へ変換せず「桁数→文字列」で比べる。u128に収まらない
+                    // 桁数（39桁超）のファイル名でも正しく並ぶため
+                    // （変換に頼ると、収まらない値がどれも同じ扱いになる）。
+                    let ta = na.trim_start_matches('0');
+                    let tb = nb.trim_start_matches('0');
+                    match ta.len().cmp(&tb.len()).then_with(|| ta.cmp(tb)) {
                         Ordering::Equal => match na.len().cmp(&nb.len()) {
                             Ordering::Equal => {}
                             o => return o,
