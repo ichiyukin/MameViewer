@@ -109,7 +109,7 @@
             <button id="bm-scope-all" data-scope="all">すべて</button>
           </div>
           <button id="bm-clear-broken" class="hidden">見つからない項目をまとめて削除</button>
-          <button id="bookmarks-close" title="閉じる (Ctrl+B / Esc)">✕</button>
+          <button id="bookmarks-close" data-key-of="bookmarksList" data-title-base="閉じる" data-key-extra="Esc">✕</button>
         </div>
         <div id="bookmarks-scroll"></div>
       </div>
@@ -118,7 +118,7 @@
       <div id="help" class="hidden">
         <div class="grid-toolbar">
           <span class="grid-title">MameViewer の使い方</span>
-          <button id="help-close" title="閉じる (H / Esc)">✕</button>
+          <button id="help-close" data-key-of="toggleHelp" data-title-base="閉じる" data-key-extra="Esc">✕</button>
         </div>
         <div id="help-scroll">
           <div class="help-grid">
@@ -251,8 +251,8 @@
         <button data-act="first">先頭のページへ</button>
         <button data-act="last">最後のページへ</button>
         <div class="menu-sep"></div>
-        <button data-act="bookmarkToggle">このページにしおり (B)</button>
-        <button data-act="bookmarkList">しおり一覧 (Ctrl+B)</button>
+        <button data-act="bookmarkToggle" data-key-of="toggleBookmark">このページにしおり</button>
+        <button data-act="bookmarkList" data-key-of="bookmarksList">しおり一覧</button>
         <div class="menu-sep"></div>
         <span class="menu-label">巻末に達したら</span>
         <button data-end="loop">同じ巻の先頭に戻る</button>
@@ -261,7 +261,7 @@
 
       <!-- 設定メニュー（使い方・キー割り当て・動作の軽快さ等、システム的な項目。専用ボタンで開閉） -->
       <div id="settings-menu" class="dropdown-menu hidden">
-        <button data-act="help">使い方（説明書） (H)</button>
+        <button data-act="help" data-key-of="toggleHelp">使い方（説明書）</button>
         <button data-act="keybind">キー割り当てを変更</button>
         <button data-act="about">このアプリについて</button>
         <div class="menu-sep"></div>
@@ -284,7 +284,7 @@
       <!-- 表示設定メニュー（見開き・回転・フィット。専用ボタンで開閉） -->
       <div id="display-menu" class="dropdown-menu hidden">
         <span class="menu-label">表示</span>
-        <button data-act="spread">見開き表示 (D)</button>
+        <button data-act="spread" data-key-of="toggleSpread">見開き表示</button>
         <button data-act="rotate">回転（クリックで90°ずつ）</button>
         <div class="menu-sep"></div>
         <span class="menu-label">フィット</span>
@@ -324,9 +324,9 @@
           <button id="prev" title="前のページ">◀</button>
           <button id="next" title="次のページ">▶</button>
           <button id="next-vol" title="次の巻">▶▶</button>
-          <button id="bookmark-btn" title="このページにしおりを挟む (B)">🔖</button>
+          <button id="bookmark-btn" data-key-of="toggleBookmark" data-title-base="このページにしおりを挟む">🔖</button>
           <button id="shelf-btn" title="本棚（お気に入りの本）">📚</button>
-          <button id="grid-btn" title="サムネイル一覧 (A)">▦</button>
+          <button id="grid-btn" data-key-of="toggleGrid" data-title-base="サムネイル一覧">▦</button>
         </div>
         <input id="seek" type="range" min="0" max="0" value="0" disabled />
         <span id="counter"></span>

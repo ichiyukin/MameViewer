@@ -20,6 +20,9 @@ let pageSource: "archive" | "pdf" | "text" = "archive";
 let pageCount = 0;
 let current = 0;
 let barTimer: number | undefined;
+// 本棚は下部バーの上に載るため、開いている間はバーを引っ込めない。
+// flashBar() から参照するので、ここ（バー関連の状態）に置く。
+let shelfOpen = false;
 
 // 履歴・巻移動。currentAnchor は今開いている「巻」の識別パス
 // （アーカイブファイルなら自身のパス、フォルダ/単独画像ならフォルダの基点パス）。
@@ -250,9 +253,20 @@ function formatKeyLabel(b: KeyBinding): string {
 function keyMatches(e: KeyboardEvent, b: KeyBinding): boolean {
   if (!b.key) return false;
   if (!!b.ctrl !== e.ctrlKey) return false;
+  // Alt・Windowsキーを伴う操作（Alt+Dのメニュー呼び出し等）は横取りしない。
+  // どの割り当てもこれらを使わないので、押されていたら一致させない。
+  if (e.altKey || e.metaKey) return false;
   if (e.key.toLowerCase() === b.key.toLowerCase()) return true;
-  if (b.key === "+" && e.key === "=") return true;
+  // "="の救済は、"="自体が他の操作に割り当てられていない時だけ行う。
+  // でないと"="を割り当てても拡大が一緒に動いてしまう。
+  if (b.key === "+" && e.key === "=" && !isKeyAssigned("=")) return true;
   return false;
+}
+
+/// そのキーが（"+"の救済を除いて）何かの操作に割り当てられているか。
+function isKeyAssigned(key: string): boolean {
+  const lower = key.toLowerCase();
+  return ACTION_ORDER.some((id) => (keymap[id].key || "").toLowerCase() === lower);
 }
 
 function matchAction(e: KeyboardEvent, action: ActionId): boolean {
@@ -1099,7 +1113,14 @@ function relayoutForViewerSize() {
   else applyLayoutSettled();
 }
 
-window.addEventListener("resize", relayoutForViewerSize);
+window.addEventListener("resize", () => {
+  relayoutForViewerSize();
+  // ウィンドウを狭めた時、ツリーの幅は上限（画面幅の6割）を超えたまま残り、
+  // 表示領域を潰してしまう。今の幅を入れ直して上限を効かせる。
+  applyTreeWidth(treeWidth);
+  // 開いているメニューは、上部バーやボタンの位置が変わると置き場所がずれる。
+  repositionOpenMenus();
+});
 
 // ---- 表示 ----
 // 見開き時、実際に画面へ表示しているページ数（1 または 2）。
@@ -2569,6 +2590,9 @@ function endOpening(seq: number) {
   stopReadProgressPolling();
   loadingNote.classList.add("hidden");
   if (!treeAtPlaces) renderTree();
+  // 開いた時点で「最後に開いた本」として記録する。ページを送るまで記録しないと、
+  // 開いてすぐ閉じた場合に次回の再開が前の本に戻ってしまう。
+  schedulePositionSave();
 }
 
 // ---- 巻移動 ----
@@ -2634,6 +2658,7 @@ async function pickFolder() {
 function flashBar() {
   bar.classList.add("show");
   window.clearTimeout(barTimer);
+  if (shelfOpen) return; // 本棚を開いている間は引っ込めない（土台ごと消えてしまう）
   barTimer = window.setTimeout(() => {
     bar.classList.remove("show");
   }, 1400);
@@ -2846,6 +2871,28 @@ function assignKey(action: ActionId, binding: KeyBinding) {
   }
   keymap[action] = binding;
   saveKeymap();
+  refreshKeyLabels(); // メニューやボタンの「(B)」等の表記も合わせる
+}
+
+/// メニュー項目やボタンに出しているキー表記を、現在の割り当てから書き直す。
+/// 固定文字で書いていると、割り当てを変えた後も古いキーを案内し続けるため。
+function refreshKeyLabels() {
+  for (const el of document.querySelectorAll<HTMLElement>("[data-key-of]")) {
+    const id = el.dataset.keyOf as ActionId;
+    const b = keymap[id];
+    if (!b) continue;
+    const extra = el.dataset.keyExtra ? ` / ${el.dataset.keyExtra}` : "";
+    const inner = b.key ? formatKeyLabel(b) + extra : el.dataset.keyExtra || "";
+    const suffix = inner ? ` (${inner})` : "";
+    const titleBase = el.dataset.titleBase;
+    if (titleBase !== undefined) {
+      el.title = titleBase + suffix;
+      continue;
+    }
+    // 初回の文字列を基準として覚えておく（二度目以降に重ねて付けないため）。
+    if (el.dataset.labelBase === undefined) el.dataset.labelBase = el.textContent ?? "";
+    el.textContent = el.dataset.labelBase + suffix;
+  }
 }
 
 // ---- 表示設定メニュー（見開き・回転・フィット） ----
@@ -2876,6 +2923,20 @@ displayMenu.addEventListener("click", (e) => {
 document
   .querySelector("#display-menu-btn")
   ?.addEventListener("click", () => toggleDisplayMenu());
+
+/// 開いているドロップダウンの位置を、今のボタン位置に合わせて置き直す。
+function repositionOpenMenus() {
+  const pairs: [HTMLElement, string][] = [
+    [menu, "#menu-btn"],
+    [settingsMenu, "#settings-menu-btn"],
+    [displayMenu, "#display-menu-btn"],
+  ];
+  for (const [menuEl, btnSel] of pairs) {
+    if (menuEl.classList.contains("hidden")) continue;
+    const btn = document.querySelector<HTMLElement>(btnSel);
+    if (btn) positionMenuAboveButton(menuEl, btn);
+  }
+}
 
 // ---- 回転・フィットモード・綴じ方向・見開き ----
 function cycleRotation() {
@@ -2952,6 +3013,7 @@ function setEndBehavior(mode: "loop" | "next") {
 setFitMode(fitMode);
 updateBindUi();
 updateRotationUi();
+refreshKeyLabels();
 if (spreadMode) {
   for (const b of displayMenu.querySelectorAll<HTMLButtonElement>('[data-act="spread"]')) {
     b.classList.add("active");
@@ -3210,7 +3272,6 @@ interface ShelfItemView {
   exists: boolean;
 }
 
-let shelfOpen = false;
 const shelfEl = document.querySelector<HTMLDivElement>("#shelf")!;
 const shelfScrollEl = document.querySelector<HTMLDivElement>("#shelf-scroll")!;
 const shelfAddBtn = document.querySelector<HTMLButtonElement>("#shelf-add-btn")!;
@@ -3307,9 +3368,14 @@ async function toggleShelf(force?: boolean) {
   shelfOpen = force ?? !shelfOpen;
   shelfEl.classList.toggle("hidden", !shelfOpen);
   if (shelfOpen) {
-    bar.classList.add("show"); // 本棚は下部バーの上に出るため、バーも一緒に見せる
+    // 本棚は下部バーの上に出るため、バーも一緒に見せたままにする。
+    // 予約済みの引っ込め処理を取り消さないと、1.4秒後に土台だけ消えてしまう。
+    window.clearTimeout(barTimer);
+    bar.classList.add("show");
     await buildShelfList();
     updateShelfAddBtnUi();
+  } else {
+    flashBar(); // 閉じたら通常どおり少し見せてから引っ込める
   }
 }
 
@@ -3625,6 +3691,12 @@ window.addEventListener("keydown", (e) => {
     if (e.key === "Escape") closeTextsPanel();
     return;
   }
+  // 再開確認ダイアログ表示中は、選ばれる前にページ操作が走らないようにする
+  // （選択待ちの裏でめくられると、再開位置が分からなくなる）。
+  if (!resumeDialog.classList.contains("hidden")) {
+    if (e.key === "Escape") resumeDialog.classList.add("hidden");
+    return;
+  }
   // 説明書・サムネイル一覧・しおり一覧は、他のパネルが開いていても常に開閉できる。
   if (matchAction(e, "toggleHelp")) {
     e.preventDefault();
@@ -3753,6 +3825,11 @@ async function initHistoryAndResume() {
     setEndBehavior(h.endBehavior ?? "loop");
     const lastOpened = h.lastOpened;
 
+    // もう無いファイルを勧めない（消した・外付けを外した本で「続きから」を
+    // 押すとエラーになるだけなので、最初から出さない）。
+    if (lastOpened && !(await invoke<boolean>("path_exists", { path: lastOpened }))) {
+      return;
+    }
     if (lastOpened) {
       const page = h.positions[lastOpened] ?? 0;
       resumeName.textContent = basenameOf(lastOpened);

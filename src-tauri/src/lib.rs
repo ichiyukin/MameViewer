@@ -1230,6 +1230,15 @@ async fn get_file_size(path: String) -> u64 {
 }
 
 /// 指定パスが開けるフォルダかを確かめる（パス直接入力の検証用）。
+/// パス（ファイルでもフォルダでも）が実在するか。
+/// 再開確認で「もう無い本」を勧めないために使う。
+#[tauri::command]
+async fn path_exists(path: String) -> bool {
+    tauri::async_runtime::spawn_blocking(move || Path::new(&path).exists())
+        .await
+        .unwrap_or(false)
+}
+
 #[tauri::command]
 async fn dir_exists(path: String) -> bool {
     tauri::async_runtime::spawn_blocking(move || Path::new(&path).is_dir())
@@ -2673,6 +2682,7 @@ pub fn run() {
             read_text_file,
             list_places,
             dir_exists,
+            path_exists,
             get_file_size,
             get_read_progress,
             get_page_name,

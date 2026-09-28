@@ -988,7 +988,9 @@ body {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  z-index: 10;
+  /* 本棚(12)・ナビゲーター(15)より前へ。10のままだと、それらが開いている時に
+     メニューが裏へ回り込んで選べなくなる。 */
+  z-index: 18;
 }
 .dropdown-menu.hidden {
   display: none;
