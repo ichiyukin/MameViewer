@@ -404,6 +404,12 @@ body {
   color: var(--accent);
 }
 
+/* 絵を作れない種類（PDF・テキスト）のしおり・本棚の枠。
+   壊れた画像アイコンを見せず、無地の板として置く。 */
+.no-thumb {
+  background: rgba(255, 255, 255, 0.08);
+}
+
 /* 同梱テキスト：一覧と本文を1枚のパネルで切り替える */
 #texts {
   position: absolute;
@@ -778,6 +784,20 @@ body {
 /* 上部バーのボタン群は横幅いっぱいに広げ、設定(⚙)だけ右端へ寄せる */
 #topbar .nav {
   flex: 1;
+}
+/* 表示中のページのファイル名。ボタン群と⚙の間の余った幅に収め、
+   長い名前は末尾を省略する（全文はマウスを乗せると出る）。 */
+#current-file {
+  flex: 1;
+  min-width: 0;
+  margin-left: 10px;
+  font-size: 0.72rem;
+  color: #999;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: default;
+  user-select: text; /* 名前をコピーできるようにする */
 }
 #topbar #settings-menu-btn {
   margin-left: auto;

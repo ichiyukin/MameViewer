@@ -695,6 +695,7 @@ function resetPageCache() {
   for (const url of pageCache.values()) URL.revokeObjectURL(url);
   pageCache.clear();
   pageBytes.clear();
+  pageNames.clear();
   cacheBytesTotal = 0;
   predecoded.clear();
   pageInflight.clear();
@@ -882,7 +883,13 @@ navigatorEl.addEventListener("mousedown", (e) => {
   jumpNavigatorTo(e.clientX, e.clientY);
 });
 window.addEventListener("mousemove", (e) => {
-  if (navDragging) jumpNavigatorTo(e.clientX, e.clientY);
+  if (!navDragging) return;
+  // ウィンドウ外で離された場合に備え、押されていなければ解除する。
+  if (!(e.buttons & 1)) {
+    navDragging = false;
+    return;
+  }
+  jumpNavigatorTo(e.clientX, e.clientY);
 });
 window.addEventListener("mouseup", () => {
   // ミニマップ外まで引っ張って離すと、click はミニマップではなく画像側で
@@ -1296,11 +1303,15 @@ function buildTextView() {
 }
 
 /// 単体のテキストファイルを開く（画像と同じく、ページ送りで読む）。
-async function openTextFile(path: string, reset = false) {
+async function openTextFile(path: string, reset = false, seq = beginOpenRequest()) {
   stopProgressPolling();
   resumeDialog.classList.add("hidden");
   try {
-    textSource = await invoke<string>("read_text_file", { path });
+    invoke("note_open_seq", { seq }).catch(() => {}); // PDFと同じ理由
+    await invoke("close_archive").catch(() => {}); // 前の本の絵・一覧を引き継がせない
+    const body = await invoke<string>("read_text_file", { path });
+    if (!isCurrentOpen(seq)) return; // 読み込み中に別のファイルが開かれた
+    textSource = body;
     textIsMarkdown = extOf(path) === "md";
     pageSource = "text";
     archiveGen++;
@@ -1314,7 +1325,7 @@ async function openTextFile(path: string, reset = false) {
     setTreeRootForAnchor(path);
     hint.style.display = "none";
     seek.disabled = false;
-    if (gridOpen) closeGrid();
+    closeStalePanels(); // 前の本を指したままのパネルを閉じる
     setOpeningPhase("本文を組み立て中…");
     buildTextView();
     if (!reset) {
@@ -1326,6 +1337,7 @@ async function openTextFile(path: string, reset = false) {
       }
     }
   } catch (e) {
+    if (isSuperseded(e)) return; // 別のファイルが開かれたので捨てられただけ。失敗ではない
     alert("開けませんでした: " + e);
   }
 }
@@ -1395,16 +1407,63 @@ function closeTextsPanel() {
 
 document.querySelector("#texts-close")?.addEventListener("click", closeTextsPanel);
 
+// 上部バーに出す「今見ているページのファイル名」。
+// 表示中のものが分かると、どのファイルを読んでいるか確認するために
+// ウィンドウのタイトルやフォルダを見に行く必要がなくなる。
+const currentFileEl = document.querySelector<HTMLSpanElement>("#current-file")!;
+// ページ名はアーカイブを開いている間は変わらないので覚えておく。
+// ページ送りのたびにIPCを往復させると、軽快さを損なうため。
+const pageNames = new Map<number, string>();
+
+async function fetchPageName(index: number): Promise<string> {
+  const hit = pageNames.get(index);
+  if (hit !== undefined) return hit;
+  const gen = archiveGen;
+  const name = await invoke<string>("get_page_name", { index }).catch(() => "");
+  if (gen === archiveGen) pageNames.set(index, name);
+  return name;
+}
+
+async function updateCurrentFileName() {
+  if (pageCount === 0) {
+    currentFileEl.textContent = "";
+    currentFileEl.title = "";
+    return;
+  }
+  // PDFとテキストはRust側にページ一覧が無いので、ファイル自体の名前を出す。
+  if (pageSource !== "archive") {
+    const name = currentAnchor ? basenameOf(currentAnchor) : "";
+    currentFileEl.textContent = name;
+    currentFileEl.title = name;
+    return;
+  }
+  // 取得中にページが進んだ場合、古い結果で上書きしないよう控えておく。
+  const gen = archiveGen;
+  const at = current;
+  const count = shownCount === 2 ? 2 : 1; // 見開き表示中は2ページ分を並べる
+  const names: string[] = [];
+  for (let i = 0; i < count; i++) {
+    const n = await fetchPageName(at + i);
+    if (n) names.push(n);
+  }
+  if (gen !== archiveGen || at !== current) return;
+  const text = names.join(" ／ ");
+  currentFileEl.textContent = text;
+  currentFileEl.title = text;
+}
+
 async function render() {
   if (pageSource === "text") {
     // 本文は既に組んであるので、表示位置をずらすだけ（組み直しはしない）。
     showTextPage(current);
+    updateCurrentFileName();
     return;
   }
   hideTextView();
   if (pageCount === 0) return;
   if (spreadMode) await renderSpread();
   else await renderSingle();
+  updateCurrentFileName();
 }
 
 function go(delta: number) {
@@ -2053,6 +2112,11 @@ treeResizer.addEventListener("mousedown", (e) => {
 
 window.addEventListener("mousemove", (e) => {
   if (!treeResizing) return;
+  if (!(e.buttons & 1)) {
+    treeResizing = false;
+    treeResizer.classList.remove("dragging");
+    return;
+  }
   // 描画フレームに合わせて間引く（毎イベントで作り直すと画像の再計算が重なる）。
   treeResizePendingX = e.clientX;
   if (treeResizeFramePending) return;
@@ -2115,14 +2179,16 @@ updateTreeSortUi();
 
 // ---- アーカイブを開く ----
 // reset=true の場合、記憶されている位置を無視して先頭ページから開く（「最初から読む」用）。
-async function openArchive(path: string, reset = false) {
+async function openArchive(path: string, reset = false, seq = beginOpenRequest()) {
   stopProgressPolling(); // 前のファイルの進捗表示が残らないようにする
   resumeDialog.classList.add("hidden"); // 再開確認ダイアログが出ていても、新規に開く操作を優先する
   try {
     const res = await invoke<{ count: number; initialIndex: number }>("open_archive", {
       path,
       reset,
+      seq,
     });
+    if (!isCurrentOpen(seq)) return; // 読み込み中に別のファイルが開かれた
     archiveGen++;
     pageSource = "archive";
     resetPageCache();
@@ -2136,11 +2202,12 @@ async function openArchive(path: string, reset = false) {
     hint.style.display = "none";
     seek.disabled = false;
     seek.max = String(pageCount - 1);
-    if (gridOpen) closeGrid();
+    closeStalePanels(); // 前の本を指したままのパネルを閉じる
     startProgressPolling();
     setOpeningPhase("1ページ目を読み込み中…");
     await render();
   } catch (e) {
+    if (isSuperseded(e)) return; // 別のファイルが開かれたので捨てられただけ。失敗ではない
     alert("開けませんでした: " + e);
   }
 }
@@ -2149,7 +2216,7 @@ async function openArchive(path: string, reset = false) {
 // 画像ファイルなら、その親フォルダの画像を一覧化してその位置から表示する。
 // フォルダなら、その中の画像を先頭から表示する。サブフォルダがあれば、
 // 含めて読み込むかを確認する。reset=true の場合は先頭ページから開く。
-async function openImageOrFolder(path: string, reset = false) {
+async function openImageOrFolder(path: string, reset = false, seq = beginOpenRequest()) {
   stopProgressPolling(); // 前のファイルの進捗表示が残らないようにする
   resumeDialog.classList.add("hidden"); // 再開確認ダイアログが出ていても、新規に開く操作を優先する
   try {
@@ -2163,8 +2230,9 @@ async function openImageOrFolder(path: string, reset = false) {
     }
     const res = await invoke<{ count: number; initialIndex: number; dir: string }>(
       "open_folder",
-      { path, recursive, reset }
+      { path, recursive, reset, seq }
     );
+    if (!isCurrentOpen(seq)) return; // 読み込み中に別のファイルが開かれた
     archiveGen++;
     pageSource = "archive";
     resetPageCache();
@@ -2178,25 +2246,59 @@ async function openImageOrFolder(path: string, reset = false) {
     hint.style.display = "none";
     seek.disabled = false;
     seek.max = String(pageCount - 1);
-    if (gridOpen) closeGrid();
+    closeStalePanels(); // 前の本を指したままのパネルを閉じる
     startProgressPolling();
     setOpeningPhase("1ページ目を読み込み中…");
     await render();
   } catch (e) {
+    if (isSuperseded(e)) return; // 別のファイルが開かれたので捨てられただけ。失敗ではない
     alert("開けませんでした: " + e);
   }
 }
 
+// ---- 開く要求の通し番号 ----
+// 遅いファイルAを開いている最中に軽いファイルBを開くと、Bが先に表示された後で
+// Aが完了して勝手にAへ切り替わってしまう。後から始まった方を正として、
+// 古い要求の結果は静かに捨てる。
+let openSeq = 0;
+function beginOpenRequest(): number {
+  // 画面が再読み込みされると変数は0に戻るが、Rust側の番号は下がらない。
+  // 巻き戻ると以後すべての要求が「追い越された」と判定されて捨てられ、
+  // 何を開いても無反応になる。時刻を下限にして必ず増え続けるようにする。
+  openSeq = Math.max(openSeq + 1, Date.now());
+  return openSeq;
+}
+function isCurrentOpen(seq: number): boolean {
+  return seq === openSeq;
+}
+/// 途中で別のファイルが開かれた時にRust側が返す印。失敗ではないので警告は出さない。
+const OPEN_SUPERSEDED = "__superseded__";
+function isSuperseded(e: unknown): boolean {
+  return String(e).includes(OPEN_SUPERSEDED);
+}
+
 // ---- PDFを開く ----
 // ページの中身はpdf.jsが供給するが、ページ番号・履歴・しおりは画像と同じ仕組みに乗せる。
-async function openPdf(path: string, reset = false) {
+async function openPdf(path: string, reset = false, seq = beginOpenRequest()) {
   stopProgressPolling();
   resumeDialog.classList.add("hidden");
   try {
+    // 実際に開くコマンドを呼ばないので、番号だけ先にRustへ伝える
+    // （追い越されたアーカイブ読み込みをRust側でも捨てられるようにするため）。
+    invoke("note_open_seq", { seq }).catch(() => {});
+    // 前のアーカイブを閉じる。残したままだとサムネイル一覧・しおりの絵・
+    // 同梱テキストが「前の本のもの」になる。
+    await invoke("close_archive").catch(() => {});
     const lib = await loadPdfLib();
     const buf = await invoke<ArrayBuffer>("read_file_bytes", { path });
     const task = lib.getDocument({ data: new Uint8Array(buf) }) as unknown as PdfLoadingTask;
     const doc = (await task.promise) as PdfDoc;
+    if (!isCurrentOpen(seq)) {
+      // 読み込み中に別のファイルが開かれた。開いたワーカーとPDF全体の
+      // バッファを解放してから抜ける（放置するとスレッドが漏れる）。
+      await task.destroy().catch(() => {});
+      return;
+    }
     // 前のPDFの読み込みタスクを片付けてから差し替える（ワーカーを残さないため）。
     if (pdfLoadingTask) await pdfLoadingTask.destroy().catch(() => {});
     pdfLoadingTask = task;
@@ -2220,33 +2322,35 @@ async function openPdf(path: string, reset = false) {
     hint.style.display = "none";
     seek.disabled = false;
     seek.max = String(pageCount - 1);
-    if (gridOpen) closeGrid();
+    closeStalePanels(); // 前の本を指したままのパネルを閉じる
     setOpeningPhase("1ページ目を読み込み中…");
     await render();
   } catch (e) {
+    if (isSuperseded(e)) return; // 別のファイルが開かれたので捨てられただけ。失敗ではない
     alert("開けませんでした: " + e);
   }
 }
 
 // 拡張子からアーカイブ／PDF／テキスト／画像・フォルダのどの開き方をすべきか振り分ける。
-async function openPath(path: string) {
+async function openPath(path: string, reset = false) {
   // ネットワーク上の大きなファイルは開き終わるまで数十秒かかることがある。
   // その間、選択したことが画面に出ないと「押しても反応しない」と見えるため、
   // 待ちに入る前に、選んだ項目と読み込み中であることを先に表示する。
-  beginOpening(path);
+  const seq = beginOpenRequest();
+  beginOpening(path, seq);
   try {
     const ext = extOf(path);
     if (ARCHIVE_EXTS.includes(ext)) {
-      await openArchive(path);
+      await openArchive(path, reset, seq);
     } else if (ext === "pdf") {
-      await openPdf(path);
+      await openPdf(path, reset, seq);
     } else if (TEXT_EXTS.includes(ext)) {
-      await openTextFile(path);
+      await openTextFile(path, reset, seq);
     } else {
-      await openImageOrFolder(path);
+      await openImageOrFolder(path, reset, seq);
     }
   } finally {
-    endOpening();
+    endOpening(seq); // 自分が出した表示だけを消す
   }
 }
 
@@ -2266,7 +2370,13 @@ function formatBytes(n: number): string {
   return `${n} B`;
 }
 
-function beginOpening(path: string) {
+// 今この表示を出している要求の番号。別経路（フォルダ選択ダイアログや
+// 再開ダイアログ）が通し番号だけ進めた場合でも、表示を出した本人が
+// 消せるようにしておく（持ち主を見ないと表示が消えずに残る）。
+let loadingNoteSeq = 0;
+
+function beginOpening(path: string, seq: number) {
+  loadingNoteSeq = seq;
   treeLoadingPath = path;
   treeHighlightPath = path; // 選んだ項目をその場で選択状態にする
   // 「場所」一覧の表示中は renderTree() が一覧を消してしまうため触らない。
@@ -2343,7 +2453,8 @@ function setOpeningPhase(text: string) {
   loadingPhase.textContent = text;
 }
 
-function endOpening() {
+function endOpening(seq: number) {
+  if (loadingNoteSeq !== seq) return; // 後から始まった読み込みの表示は消さない
   treeLoadingPath = null;
   stopReadProgressPolling();
   loadingNote.classList.add("hidden");
@@ -2777,8 +2888,18 @@ function adjustThumb(delta: number) {
   setThumbSize(v);
 }
 
+// 別の本を開いた時、前の本の内容を指したまま残るパネルを閉じる。
+// 開きっぱなしだと前の本の一覧が出続けるうえ、開閉フラグのせいで
+// クリックやキー操作も封じられたままになる。
+function closeStalePanels() {
+  if (gridOpen) closeGrid();
+  if (bmOpen) closeBookmarks();
+  if (textsOpen) closeTextsPanel();
+}
+
 function openGrid() {
   if (pageCount === 0) return;
+  if (pageSource === "text") return; // 本文にはページの絵が無い
   gridOpen = true;
   gridGen++;
   buildGrid();
@@ -2898,15 +3019,16 @@ const bookmarkBtn = document.querySelector<HTMLButtonElement>("#bookmark-btn")!;
 // 現在の本のしおりページ番号。ページ送りのたびにRust側へ問い合わせると
 // IPC往復がページ数分積み重なるため、本を開いた時に一度だけ取得して保持する。
 let bookmarkedPages = new Set<number>();
-let bookmarkedAnchor: string | null = null;
 
 async function loadBookmarkedPages() {
+  // 比較対象はローカルに控える。共有の変数どうしを比べると、後から始まった
+  // 呼び出しが両方を書き換えてしまい、判定が永久に成立しない。
+  const anchor = currentAnchor;
   bookmarkedPages = new Set();
-  bookmarkedAnchor = currentAnchor;
-  if (!currentAnchor) return;
+  if (!anchor) return;
   try {
-    const list = await invoke<BookmarkView[]>("list_bookmarks", { anchor: currentAnchor });
-    if (bookmarkedAnchor !== currentAnchor) return; // 取得中に別の本へ切り替わった
+    const list = await invoke<BookmarkView[]>("list_bookmarks", { anchor });
+    if (anchor !== currentAnchor) return; // 取得中に別の本へ切り替わった
     for (const b of list) bookmarkedPages.add(b.page);
   } catch (e) {
     console.error("しおり情報の取得に失敗:", e);
@@ -2976,7 +3098,9 @@ async function buildShelfList() {
       cell.title = item.exists ? item.anchor : `${item.anchor}（見つかりません）`;
 
       const img = document.createElement("img");
-      img.src = `data:image/jpeg;base64,${item.thumbBase64}`;
+      // 絵を作れない種類（PDF・テキスト）では空で返る。壊れた画像を出さない。
+      if (item.thumbBase64) img.src = `data:image/jpeg;base64,${item.thumbBase64}`;
+      else img.classList.add("no-thumb");
       img.alt = "";
       img.draggable = false;
 
@@ -3070,7 +3194,8 @@ function renderBookmarkCell(bm: BookmarkView): HTMLDivElement {
   cell.className = "bm-cell" + (bm.exists ? "" : " broken");
 
   const img = document.createElement("img");
-  img.src = `data:image/jpeg;base64,${bm.thumbBase64}`;
+  if (bm.thumbBase64) img.src = `data:image/jpeg;base64,${bm.thumbBase64}`;
+  else img.classList.add("no-thumb");
   if (bm.exists) {
     img.title = "クリックでこのページへ";
     img.style.cursor = "pointer";
@@ -3167,7 +3292,8 @@ bmClearBrokenBtn.addEventListener("click", async () => {
 window.addEventListener(
   "wheel",
   (e) => {
-    if (helpOpen || keybindOpen || aboutOpen) return; // パネル表示中は通常のスクロールに任せる
+    // パネル表示中は背後のページを送らない（そのパネル内のスクロールに任せる）
+    if (helpOpen || keybindOpen || aboutOpen || bmOpen || textsOpen) return;
     if (onUi(e)) return; // フォルダツリー等のUI上ではページめくりせず、その要素のスクロールに任せる
     if (gridOpen) {
       if (e.ctrlKey) {
@@ -3199,7 +3325,7 @@ window.addEventListener(
 // UI領域（バー・メニュー・一覧・案内）上のクリックはページ送りに使わない
 function onUi(e: Event): boolean {
   return !!(e.target as HTMLElement).closest(
-    "#tree-panel, #tree-resizer, #shelf, #bar, #topbar, #menu, #display-menu, #settings-menu, #grid, #hint, #bookmarks, #resume-dialog, #help, #keybind, #about, #navigator-panel, #texts"
+    "#tree-panel, #tree-resizer, #tree-context, #shelf, #bar, #topbar, #menu, #display-menu, #settings-menu, #grid, #hint, #bookmarks, #resume-dialog, #help, #keybind, #about, #navigator-panel, #texts"
   );
 }
 
@@ -3322,6 +3448,16 @@ window.addEventListener("contextmenu", (e) => {
 
 // キーボード
 window.addEventListener("keydown", (e) => {
+  // 文字を入力している最中はキー割り当てを発火させない。
+  // これが無いと、パス入力欄に打った a・d・b などが操作として奪われ、
+  // preventDefault で文字そのものが入らなくなる（入力欄が使えなくなる）。
+  const target = e.target as HTMLElement | null;
+  if (
+    target &&
+    (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)
+  ) {
+    return;
+  }
   // キー割り当て変更の「変更」待ち中：次に押されたキーをそのまま割り当てる。
   // Escapeは（システム的な意味を保つため）割り当てず、単に待機をキャンセルする。
   if (awaitingRebind) {
@@ -3394,7 +3530,16 @@ window.addEventListener("keydown", (e) => {
 
 // ウィンドウがフォーカスを失った場合の保険（ドラッグ状態が固着しないように）。
 window.addEventListener("blur", () => {
+  // ウィンドウの外でボタンを離すと mouseup が届かず、押下状態が固着する。
+  // 固着すると「ホイールがズームや巻送りのまま戻らない」「ボタンを押して
+  // いないのにミニマップやツリー幅が追従し続ける」といった状態になる。
   panning = false;
+  s1Down = false;
+  s2Down = false;
+  navDragging = false;
+  treeResizing = false;
+  treeResizer.classList.remove("dragging");
+  justPanned = false;
   viewer.style.cursor = canPan() ? "grab" : "";
   flushPositionSave(); // 閉じる・切り替える直前に読書位置を確定させる
 });
@@ -3485,9 +3630,8 @@ async function initHistoryAndResume() {
       };
       restartBtn.onclick = async () => {
         resumeDialog.classList.add("hidden");
-        const ext = extOf(lastOpened);
-        if (ARCHIVE_EXTS.includes(ext)) await openArchive(lastOpened, true);
-        else await openImageOrFolder(lastOpened, true);
+        // openPath と同じ振り分けを使う（PDF・テキストを取りこぼさないため）。
+        await openPath(lastOpened, true);
       };
       // 「新しいファイル」＝ダイアログを閉じてファイル選択（旧キャンセルは実質これと同じ導線のため統合）。
       document.querySelector<HTMLButtonElement>("#resume-cancel")!.onclick = () => {

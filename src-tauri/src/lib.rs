@@ -67,6 +67,21 @@ static INNER_CACHE: LazyLock<Mutex<Vec<(String, Arc<Vec<u8>>)>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 const INNER_CACHE_CAP: usize = 2;
 
+/// 文字列を短い16進へ潰す。一時ファイル名に外側アーカイブの識別子を混ぜるために使う
+/// （パスをそのまま使うとファイル名に出来ないため）。
+fn short_hash(s: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+/// 入れ子キャッシュのキー。内部の名前だけだと `vol1.zip` のような
+/// ありふれた名前が別の本と衝突し、他の本の画像がページとして出てしまう。
+fn inner_cache_key(outer_path: &Path, inner_name: &str) -> String {
+    format!("{}|{}", outer_path.to_string_lossy(), inner_name)
+}
+
 // ---- 履歴・巻移動 ----
 // 「巻（アーカイブファイル or フォルダ）」ごとの最終閲覧ページを記憶し、
 // 起動時の自動再開・巻間移動時の位置復元に使う。
@@ -409,8 +424,11 @@ fn try_relink_bookmarks(new_path: &str) {
 }
 
 fn add_bookmark_sync(anchor: String, page: usize) -> Result<BookmarkView, String> {
-    let thumb = make_thumbnail(page)?;
-    let thumb_base64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &*thumb);
+    // PDF・テキストでは絵を作れないが、登録そのものは成立させる。
+    // 失敗にすると、利用者にはしおりが付かない理由が分からない。
+    let thumb_base64 = make_thumbnail(page)
+        .map(|t| base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &*t))
+        .unwrap_or_default();
     let file_name = Path::new(&anchor)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -637,9 +655,9 @@ fn now_epoch_secs() -> u64 {
 #[tauri::command]
 async fn add_to_shelf(anchor: String, page: usize) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let thumb = make_thumbnail(page)?;
-        let thumb_base64 =
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &*thumb);
+        let thumb_base64 = make_thumbnail(page)
+            .map(|t| base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &*t))
+            .unwrap_or_default(); // 絵が作れなくても登録は成立させる
         let file_name = Path::new(&anchor)
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -780,6 +798,26 @@ const THUMB_MAX: u32 = 360;
 
 /// サムネイル事前生成の世代番号。アーカイブを開き直すたびに増やし、旧世代の生成を中断させる。
 static THUMB_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// 「開く」要求の通し番号。開いている最中に別のファイルを開かれた場合、
+/// 先に始まった方が後から完了しても、その結果でアーカイブ状態を上書きしないために使う。
+/// これが無いと、遅いファイルAを開いている間に軽いファイルBを開くと、Bが表示された後で
+/// Aが完了してAに切り替わってしまう（表示だけでなく、以後のページ読み出しもAを指す）。
+///
+/// 番号はフロント側が発行したものを受け取る。こちらで採番すると、
+/// フォルダを開く際の「下層も読み込むか」の確認ダイアログのように
+/// コマンド到着が遅れる経路があるため、利用者が選んだ順と食い違う。
+static OPEN_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// 要求番号を記録する（実際に開くコマンドを呼ばないPDF・テキストからも呼ぶ。
+/// これを怠ると、追い越されたアーカイブ読み込みがRust側で検知できず、
+/// 状態を書き換えたうえで全ページのサムネイル生成まで走ってしまう）。
+#[tauri::command]
+fn note_open_seq(seq: u64) {
+    OPEN_SEQ.fetch_max(seq, AtomicOrd::Relaxed);
+}
+/// 途中で別のファイルが開かれたことを示す印。フロント側はこれを無視する。
+const OPEN_SUPERSEDED: &str = "__superseded__";
 
 /// サムネイル事前生成の進捗（完了数・総数）。フロントはこれをポーリングして
 /// 読み込み中の進捗バーを表示する（プッシュ通知ではなくポーリング方式）。
@@ -1487,13 +1525,57 @@ fn nested_temp_dir() -> Result<PathBuf, String> {
 /// 別のファイルを開く時に、前のファイルに紐づくキャッシュ類を破棄する。
 /// 開く処理（open_archive / open_folder / テストの open_sync）から必ず呼ぶこと。
 /// ここで捨て損ねると、ページ番号が同じ「前のファイルの中身」を返してしまう。
+#[cfg(test)]
 fn clear_nested_state() {
-    INNER_CACHE.lock().unwrap().clear();
-    RECENT_PAGES.lock().unwrap().clear();
+    clear_nested_memory();
     let d = std::env::temp_dir()
         .join("MameViewer_nested")
         .join(std::process::id().to_string());
     let _ = std::fs::remove_dir_all(d);
+}
+
+/// メモリ上のキャッシュだけを捨てる（失敗しようがなく、一時ファイルには触れない）。
+fn clear_nested_memory() {
+    INNER_CACHE.lock().unwrap().clear();
+    RECENT_PAGES.lock().unwrap().clear();
+}
+
+/// 今開いた本に属さない一時ファイルだけを片付ける。
+/// 開く前に丸ごと消すと、途中で失敗した時に「今読んでいる本」の一時ファイルまで
+/// 巻き添えで消え、入れ子ページだけが読めなくなる（直下ページは読めるので
+/// 一部だけ壊れたように見える）。そのため反映が確定してから呼ぶ。
+fn sweep_nested_temp(keep_prefix: &str) {
+    let Ok(dir) = nested_temp_dir() else { return };
+    let Ok(rd) = std::fs::read_dir(&dir) else { return };
+    for e in rd.flatten() {
+        if !e.file_name().to_string_lossy().starts_with(keep_prefix) {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
+/// 前回の異常終了などで残った、他プロセス分の一時フォルダを片付ける（起動時に1回）。
+/// 生きている別インスタンスの分を消さないよう、更新から1日以上経ったものだけを対象にする。
+fn sweep_stale_temp_dirs() {
+    let base = std::env::temp_dir().join("MameViewer_nested");
+    let me = std::process::id().to_string();
+    let Ok(rd) = std::fs::read_dir(&base) else { return };
+    let a_day = std::time::Duration::from_secs(60 * 60 * 24);
+    for e in rd.flatten() {
+        if e.file_name().to_string_lossy() == me {
+            continue;
+        }
+        let stale = e
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+            .map(|d| d > a_day)
+            .unwrap_or(false);
+        if stale {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
 }
 
 /// 内部アーカイブの展開済みバイト列を取得する（LRUキャッシュ経由）。
@@ -1504,9 +1586,10 @@ fn get_inner_bytes(
     outer_format: Format,
     inner: &InnerRef,
 ) -> Result<Arc<Vec<u8>>, String> {
+    let key = inner_cache_key(outer_path, &inner.outer_name);
     {
         let mut c = INNER_CACHE.lock().unwrap();
-        if let Some(pos) = c.iter().position(|(k, _)| k == &inner.outer_name) {
+        if let Some(pos) = c.iter().position(|(k, _)| *k == key) {
             let e = c.remove(pos);
             let bytes = e.1.clone();
             c.push(e); // 末尾＝最新（LRU更新）
@@ -1515,8 +1598,8 @@ fn get_inner_bytes(
     }
     let bytes = Arc::new(read_entry_from(outer_path, outer_format, &inner.outer_name)?);
     let mut c = INNER_CACHE.lock().unwrap();
-    if !c.iter().any(|(k, _)| k == &inner.outer_name) {
-        c.push((inner.outer_name.clone(), bytes.clone()));
+    if !c.iter().any(|(k, _)| *k == key) {
+        c.push((key, bytes.clone()));
         while c.len() > INNER_CACHE_CAP {
             c.remove(0);
         }
@@ -1542,7 +1625,10 @@ fn expand_inner_archive(
                 .chars()
                 .map(|c| if matches!(c, '/' | '\\' | ':') { '_' } else { c })
                 .collect();
-            let tmp = nested_temp_dir()?.join(flat);
+            // 外側アーカイブごとに分ける。内部の名前だけだと、別の本を
+            // 本棚に追加した時などに同じパスへ書き込まれ、読書中の本の
+            // 一時ファイルが上書きされてしまう。
+            let tmp = nested_temp_dir()?.join(format!("{}_{}", short_hash(outer_path), flat));
             std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
             (list_rar(&tmp.to_string_lossy())?, Some(tmp))
         }
@@ -1981,10 +2067,12 @@ struct OpenResult {
 /// reset=false かつ記憶されている最終閲覧ページがあれば、そこから再開する。
 /// reset=true の場合は常に先頭ページから開く（「最初から読む」用）。
 #[tauri::command]
-async fn open_archive(path: String, reset: bool) -> Result<OpenResult, String> {
+async fn open_archive(path: String, reset: bool, seq: u64) -> Result<OpenResult, String> {
+    let my_seq = seq;
+    OPEN_SEQ.fetch_max(my_seq, AtomicOrd::Relaxed);
     tauri::async_runtime::spawn_blocking(move || {
         let format = detect_format(&path)?;
-        clear_nested_state(); // 前のファイルの入れ子キャッシュ・一時ファイルを破棄
+        let keep = short_hash(&path); // この本の一時ファイルを見分ける印
         let entries = build_sorted_entries(&path, format)?;
         if entries.is_empty() {
             return Err("画像が見つかりませんでした".into());
@@ -2003,16 +2091,32 @@ async fn open_archive(path: String, reset: bool) -> Result<OpenResult, String> {
                 .min(count - 1)
         };
         try_relink_bookmarks(&path); // 移動してきた同名・同サイズファイルへブックマークを再リンク
-        *ARCHIVE.lock().unwrap() = Some(ArchiveState {
-            path: PathBuf::from(path),
-            format,
-            entries,
-        });
-        // 別アーカイブに切り替わるのでサムネイル・リサイズ済みキャッシュを破棄。
+        // 重い処理の間に別のファイルが開かれていたら、こちらの結果は捨てる。
+        // 判定と書き込みはロックを握ったまま行う（間に割り込まれないように）。
+        let gen = {
+            let mut guard = ARCHIVE.lock().unwrap();
+            if OPEN_SEQ.load(AtomicOrd::Relaxed) != my_seq {
+                return Err(OPEN_SUPERSEDED.to_string());
+            }
+            *guard = Some(ArchiveState {
+                path: PathBuf::from(path),
+                format,
+                entries,
+            });
+            // 世代の更新もロック内で行う。差し替えと世代更新の間に隙間があると、
+            // 旧アーカイブのデコードを終えたスレッドが新しい世代と誤認して
+            // キャッシュへ書き込み、前の本の画像が混入する。
+            THUMB_GEN.fetch_add(1, AtomicOrd::Relaxed) + 1
+        };
+        // ここから先は引き返さないので、安心して前の本の後始末ができる。
+        // 進捗もここで戻す。事前生成の開始（1.2秒後）まで放置すると、
+        // フロントが前の本の「完了」を読んで進捗表示を止めてしまう。
+        THUMB_TOTAL.store(0, AtomicOrd::Relaxed);
+        THUMB_DONE.store(0, AtomicOrd::Relaxed);
+        clear_nested_memory();
+        sweep_nested_temp(&keep);
         THUMBS.lock().unwrap().clear();
         RESIZED_CACHE.lock().unwrap().clear();
-        // 世代を進めて旧生成を中断し、新アーカイブの事前生成を裏で開始。
-        let gen = THUMB_GEN.fetch_add(1, AtomicOrd::Relaxed) + 1;
         tauri::async_runtime::spawn_blocking(move || pregen_thumbnails(gen));
         Ok(OpenResult { count, initial_index })
     })
@@ -2106,7 +2210,14 @@ struct FolderOpenResult {
 /// recursive=true の場合、全階層のサブフォルダの画像も含める。
 /// クリックした画像の指定が無い場合は、記憶されている最終閲覧ページから再開する。
 #[tauri::command]
-async fn open_folder(path: String, recursive: bool, reset: bool) -> Result<FolderOpenResult, String> {
+async fn open_folder(
+    path: String,
+    recursive: bool,
+    reset: bool,
+    seq: u64,
+) -> Result<FolderOpenResult, String> {
+    let my_seq = seq;
+    OPEN_SEQ.fetch_max(my_seq, AtomicOrd::Relaxed);
     tauri::async_runtime::spawn_blocking(move || {
         let p = PathBuf::from(&path);
         let focus = if p.is_dir() { None } else { Some(p.clone()) };
@@ -2139,15 +2250,26 @@ async fn open_folder(path: String, recursive: bool, reset: bool) -> Result<Folde
             }
         };
 
-        clear_nested_state(); // 前のファイルの入れ子キャッシュ・一時ファイルを破棄
-        *ARCHIVE.lock().unwrap() = Some(ArchiveState {
-            path: dir,
-            format: Format::Folder,
-            entries: entries.into_iter().map(PageEntry::direct).collect(),
-        });
+        // 走査中に別のファイルが開かれていたら、こちらの結果は捨てる。
+        let gen = {
+            let mut guard = ARCHIVE.lock().unwrap();
+            if OPEN_SEQ.load(AtomicOrd::Relaxed) != my_seq {
+                return Err(OPEN_SUPERSEDED.to_string());
+            }
+            *guard = Some(ArchiveState {
+                path: dir,
+                format: Format::Folder,
+                entries: entries.into_iter().map(PageEntry::direct).collect(),
+            });
+            THUMB_GEN.fetch_add(1, AtomicOrd::Relaxed) + 1
+        };
+        // フォルダは入れ子を持たないので、一時ファイルは全て前の本のもの。
+        THUMB_TOTAL.store(0, AtomicOrd::Relaxed);
+        THUMB_DONE.store(0, AtomicOrd::Relaxed);
+        clear_nested_memory();
+        sweep_nested_temp("");
         THUMBS.lock().unwrap().clear();
         RESIZED_CACHE.lock().unwrap().clear();
-        let gen = THUMB_GEN.fetch_add(1, AtomicOrd::Relaxed) + 1;
         tauri::async_runtime::spawn_blocking(move || pregen_thumbnails(gen));
 
         Ok(FolderOpenResult {
@@ -2259,6 +2381,53 @@ async fn read_text_file(path: String) -> Result<String, String> {
     .map_err(|e| e.to_string())?
 }
 
+/// PDF・テキストを開いた時に、前のアーカイブの状態を明示的に閉じる。
+/// これらはRust側のページ一覧を使わないため、閉じずに残すと
+/// サムネイル一覧・しおりの絵・同梱テキストが「前の本のもの」になる。
+#[tauri::command]
+async fn close_archive() {
+    tauri::async_runtime::spawn_blocking(|| {
+        {
+            let mut guard = ARCHIVE.lock().unwrap();
+            *guard = None;
+            THUMB_GEN.fetch_add(1, AtomicOrd::Relaxed); // 動作中の事前生成を止める
+        }
+        clear_nested_memory();
+        THUMBS.lock().unwrap().clear();
+        RESIZED_CACHE.lock().unwrap().clear();
+        THUMB_TOTAL.store(0, AtomicOrd::Relaxed);
+        THUMB_DONE.store(0, AtomicOrd::Relaxed);
+    })
+    .await
+    .ok();
+}
+
+/// 表示中のページの名前を返す（上部バーに出して、今どのファイルを見ているか分かるように）。
+/// フォルダを開いている場合、内部では絶対パスを持っているためファイル名だけに切り詰める。
+/// 入れ子アーカイブの中のページは「内部アーカイブ名 / 画像名」の形で返す。
+#[tauri::command]
+async fn get_page_name(index: usize) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let guard = ARCHIVE.lock().unwrap();
+        let st = guard.as_ref().ok_or("アーカイブが開かれていません")?;
+        let entry = st.entries.get(index).ok_or("ページ番号が範囲外です")?;
+        let name = if st.format == Format::Folder {
+            Path::new(&entry.name)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| entry.name.clone())
+        } else {
+            entry.name.clone()
+        };
+        Ok(match &entry.container {
+            Some(c) => format!("{} / {}", c.outer_name, name),
+            None => name,
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// 指定パスのファイルをそのまま読み出す（PDFをフロント側のpdf.jsへ渡すために使う）。
 /// アーカイブの状態とは無関係に、単体ファイルとして直接読む。
 #[tauri::command]
@@ -2317,6 +2486,7 @@ fn get_launch_path() -> Option<String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    sweep_stale_temp_dirs(); // 前回の異常終了で残った一時フォルダを片付ける
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -2356,6 +2526,9 @@ pub fn run() {
             dir_exists,
             get_file_size,
             get_read_progress,
+            get_page_name,
+            note_open_seq,
+            close_archive,
             list_favorites,
             add_favorite,
             remove_favorite,
@@ -2580,7 +2753,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         std::fs::write(base.join("a.png"), b"other-file").unwrap();
-        clear_nested_state(); // 開く処理が必ず通る破棄フック
+        clear_nested_memory(); // 開く処理が反映確定後に必ず通る破棄フック
         assert!(
             RECENT_PAGES.lock().unwrap().is_empty(),
             "ファイル切替時にキャッシュが破棄されること"
