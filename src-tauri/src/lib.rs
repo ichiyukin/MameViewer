@@ -738,13 +738,24 @@ async fn add_path_to_shelf(path: String) -> Result<(), String> {
         let (anchor, raw) = if p.is_dir() || !is_archive_ext(&path) {
             // フォルダ／単独画像：基点フォルダの先頭画像を表紙にする。
             let dir = resolve_base_dir(&p)?;
-            let mut entries = list_folder(&dir, false)?;
+            let dir_str = dir.to_string_lossy().to_string();
+            // 直下に画像が無く下層フォルダだけの場合は、開く時と同じく下層込みで扱う。
+            // 直下だけを見ると「画像が見つかりません」で登録できず、仮に登録できても
+            // 開いた本（下層込みの印付き）と別の本扱いになって本棚と結び付かない。
+            let shape = folder_shape_of(&dir)?;
+            let recursive = shape.has_subfolders && !shape.has_direct_images;
+            let mut entries = list_folder(&dir, recursive)?;
             if entries.is_empty() {
                 return Err("画像が見つかりませんでした".into());
             }
             entries.sort_by(|a, b| natural_cmp(a, b));
             let first = std::fs::read(&entries[0]).map_err(|e| e.to_string())?;
-            (dir.to_string_lossy().to_string(), first)
+            let anchor = if recursive {
+                format!("{dir_str}{RECURSIVE_MARK}")
+            } else {
+                dir_str
+            };
+            (anchor, first)
         } else {
             // アーカイブ：表紙は1枚あればよい。まず直下の画像だけを見る。
             // 全ページの構築（build_sorted_entries）は内部のアーカイブを
