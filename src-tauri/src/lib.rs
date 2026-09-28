@@ -104,10 +104,64 @@ fn default_end_behavior() -> String {
     "loop".to_string()
 }
 
-fn history_path() -> PathBuf {
-    let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(base).join("MameViewer").join("history.json")
+/// 保存ファイル（履歴・設定・しおり・本棚・お気に入り）の置き場所。
+/// テストでは必ず一時フォルダを使う。実際の保存先を使うと、しおりのテストが
+/// 利用者の bookmarks.json を書き換え、終了時に空のまま残してしまう
+/// （メモリ上は元に戻しても、ディスクへは書き戻していなかったため）。
+fn data_dir() -> PathBuf {
+    #[cfg(test)]
+    {
+        std::env::temp_dir()
+            .join("MameViewer_test_data")
+            .join(std::process::id().to_string())
+    }
+    #[cfg(not(test))]
+    {
+        let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
+        PathBuf::from(base).join("MameViewer")
+    }
 }
+
+fn history_path() -> PathBuf {
+    data_dir().join("history.json")
+}
+
+/// 保存ファイルを安全に書き出す。一時ファイルに書いてディスクへ確定させてから、
+/// 本来の名前へ置き換える。直接上書きすると、書き込みの途中で電源が落ちた・
+/// 異常終了した時にファイルが途中で切れ、次回起動時に読めずに「空」扱いとなり、
+/// 次の保存でその空が確定してしまう（しおり・本棚・読書位置がすべて消える）。
+fn write_json_atomic<T: serde::Serialize + ?Sized>(path: &Path, value: &T) {
+    use std::io::Write;
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let Ok(json) = serde_json::to_string_pretty(value) else {
+        return;
+    };
+    let tmp = path.with_extension("json.tmp");
+    let written = (|| -> std::io::Result<()> {
+        let mut f = File::create(&tmp)?;
+        f.write_all(json.as_bytes())?;
+        f.sync_all()?; // 置き換える前に中身をディスクへ確定させる
+        Ok(())
+    })();
+    if written.is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+// 保存の順序を守るための書き込み権（種類ごと）。
+// 「控えを取る→書く」の間に別の保存が割り込むと、古い控えが後から書かれて
+// 新しい内容がディスクから消える。書き込み権を取ってから控えを取れば、
+// 後に書く方が必ず新しい。呼び出し側はデータのロックを手放してから呼ぶこと
+// （書き込み権→データの順で取るため、逆に持っていると行き詰まる）。
+static HISTORY_WRITE: Mutex<()> = Mutex::new(());
+static SETTINGS_WRITE: Mutex<()> = Mutex::new(());
+static BOOKMARKS_WRITE: Mutex<()> = Mutex::new(());
+static SHELF_WRITE: Mutex<()> = Mutex::new(());
+static FAVORITES_WRITE: Mutex<()> = Mutex::new(());
 
 fn load_history_from_disk() -> HistoryData {
     let path = history_path();
@@ -117,14 +171,10 @@ fn load_history_from_disk() -> HistoryData {
         .unwrap_or_default()
 }
 
-fn persist_history(h: &HistoryData) {
-    let path = history_path();
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    if let Ok(json) = serde_json::to_string_pretty(h) {
-        let _ = std::fs::write(&path, json);
-    }
+fn persist_history() {
+    let _w = HISTORY_WRITE.lock().unwrap();
+    let snap = HISTORY.lock().unwrap().clone();
+    write_json_atomic(&history_path(), &snap);
 }
 
 static HISTORY: LazyLock<Mutex<HistoryData>> = LazyLock::new(|| Mutex::new(load_history_from_disk()));
@@ -143,10 +193,12 @@ fn get_history() -> HistoryData {
 #[tauri::command]
 async fn save_position(anchor: String, page: usize) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let mut h = HISTORY.lock().unwrap();
-        h.positions.insert(anchor.clone(), page);
-        h.last_opened = Some(anchor);
-        persist_history(&h);
+        {
+            let mut h = HISTORY.lock().unwrap();
+            h.positions.insert(anchor.clone(), page);
+            h.last_opened = Some(anchor);
+        }
+        persist_history();
     })
     .await
     .map_err(|e| e.to_string())
@@ -156,9 +208,8 @@ async fn save_position(anchor: String, page: usize) -> Result<(), String> {
 #[tauri::command]
 async fn set_end_behavior(mode: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let mut h = HISTORY.lock().unwrap();
-        h.end_behavior = mode;
-        persist_history(&h);
+        HISTORY.lock().unwrap().end_behavior = mode;
+        persist_history();
     })
     .await
     .map_err(|e| e.to_string())
@@ -191,8 +242,7 @@ impl Default for ResizeSettings {
 }
 
 fn settings_path() -> PathBuf {
-    let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(base).join("MameViewer").join("settings.json")
+    data_dir().join("settings.json")
 }
 
 fn load_settings_from_disk() -> ResizeSettings {
@@ -202,14 +252,10 @@ fn load_settings_from_disk() -> ResizeSettings {
         .unwrap_or_default()
 }
 
-fn persist_settings(s: &ResizeSettings) {
-    let path = settings_path();
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    if let Ok(json) = serde_json::to_string_pretty(s) {
-        let _ = std::fs::write(&path, json);
-    }
+fn persist_settings() {
+    let _w = SETTINGS_WRITE.lock().unwrap();
+    let snap = SETTINGS.lock().unwrap().clone();
+    write_json_atomic(&settings_path(), &snap);
 }
 
 static SETTINGS: LazyLock<Mutex<ResizeSettings>> =
@@ -223,8 +269,8 @@ fn get_settings() -> ResizeSettings {
 #[tauri::command]
 async fn set_settings(settings: ResizeSettings) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        persist_settings(&settings);
         *SETTINGS.lock().unwrap() = settings;
+        persist_settings();
         RESIZED_CACHE.lock().unwrap().clear(); // フィルター変更後は再生成させる
     })
     .await
@@ -374,8 +420,7 @@ struct BookmarkView {
 }
 
 fn bookmarks_path() -> PathBuf {
-    let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(base).join("MameViewer").join("bookmarks.json")
+    data_dir().join("bookmarks.json")
 }
 
 fn load_bookmarks_from_disk() -> Vec<Bookmark> {
@@ -385,14 +430,10 @@ fn load_bookmarks_from_disk() -> Vec<Bookmark> {
         .unwrap_or_default()
 }
 
-fn persist_bookmarks(list: &[Bookmark]) {
-    let path = bookmarks_path();
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    if let Ok(json) = serde_json::to_string_pretty(list) {
-        let _ = std::fs::write(&path, json);
-    }
+fn persist_bookmarks() {
+    let _w = BOOKMARKS_WRITE.lock().unwrap();
+    let snap = BOOKMARKS.lock().unwrap().clone();
+    write_json_atomic(&bookmarks_path(), &snap);
 }
 
 static BOOKMARKS: LazyLock<Mutex<Vec<Bookmark>>> =
@@ -433,7 +474,7 @@ fn try_relink_bookmarks(new_path: &str) {
         return;
     }
     // 保存もロックの外で行う（書き込みの間だけでも他を待たせないため）。
-    let snapshot = {
+    let changed = {
         let mut list = BOOKMARKS.lock().unwrap();
         let mut changed = false;
         for b in list.iter_mut() {
@@ -442,14 +483,10 @@ fn try_relink_bookmarks(new_path: &str) {
                 changed = true;
             }
         }
-        if changed {
-            Some(list.clone())
-        } else {
-            None
-        }
+        changed
     };
-    if let Some(list) = snapshot {
-        persist_bookmarks(&list);
+    if changed {
+        persist_bookmarks();
     }
 }
 
@@ -466,18 +503,21 @@ fn add_bookmark_sync(anchor: String, page: usize) -> Result<BookmarkView, String
         .map(|m| m.len())
         .unwrap_or(0);
 
-    let mut list = BOOKMARKS.lock().unwrap();
-    let id = list.iter().map(|b| b.id).max().unwrap_or(0) + 1;
-    let bm = Bookmark {
-        id,
-        anchor,
-        page,
-        file_name,
-        file_size,
-        thumb_base64,
+    let bm = {
+        let mut list = BOOKMARKS.lock().unwrap();
+        let id = list.iter().map(|b| b.id).max().unwrap_or(0) + 1;
+        let bm = Bookmark {
+            id,
+            anchor,
+            page,
+            file_name,
+            file_size,
+            thumb_base64,
+        };
+        list.push(bm.clone());
+        bm
     };
-    list.push(bm.clone());
-    persist_bookmarks(&list);
+    persist_bookmarks();
     Ok(BookmarkView {
         id: bm.id,
         anchor: bm.anchor,
@@ -498,12 +538,8 @@ async fn add_bookmark(anchor: String, page: usize) -> Result<BookmarkView, Strin
 
 /// 指定したしおりを削除する。
 fn remove_bookmark_sync(id: u64) {
-    let snapshot = {
-        let mut list = BOOKMARKS.lock().unwrap();
-        list.retain(|b| b.id != id);
-        list.clone()
-    };
-    persist_bookmarks(&snapshot);
+    BOOKMARKS.lock().unwrap().retain(|b| b.id != id);
+    persist_bookmarks();
 }
 
 #[tauri::command]
@@ -586,8 +622,7 @@ struct ShelfItemView {
 }
 
 fn shelf_path() -> PathBuf {
-    let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(base).join("MameViewer").join("shelf.json")
+    data_dir().join("shelf.json")
 }
 
 fn load_shelf_from_disk() -> Vec<ShelfItem> {
@@ -597,14 +632,10 @@ fn load_shelf_from_disk() -> Vec<ShelfItem> {
         .unwrap_or_default()
 }
 
-fn persist_shelf(list: &[ShelfItem]) {
-    let path = shelf_path();
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    if let Ok(json) = serde_json::to_string_pretty(list) {
-        let _ = std::fs::write(&path, json);
-    }
+fn persist_shelf() {
+    let _w = SHELF_WRITE.lock().unwrap();
+    let snap = SHELF.lock().unwrap().clone();
+    write_json_atomic(&shelf_path(), &snap);
 }
 
 static SHELF: LazyLock<Mutex<Vec<ShelfItem>>> = LazyLock::new(|| Mutex::new(load_shelf_from_disk()));
@@ -623,8 +654,7 @@ struct FavoritePlace {
 }
 
 fn favorites_path() -> PathBuf {
-    let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(base).join("MameViewer").join("favorites.json")
+    data_dir().join("favorites.json")
 }
 
 fn load_favorites_from_disk() -> Vec<FavoritePlace> {
@@ -634,14 +664,10 @@ fn load_favorites_from_disk() -> Vec<FavoritePlace> {
         .unwrap_or_default()
 }
 
-fn persist_favorites(list: &[FavoritePlace]) {
-    let path = favorites_path();
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    if let Ok(json) = serde_json::to_string_pretty(list) {
-        let _ = std::fs::write(&path, json);
-    }
+fn persist_favorites() {
+    let _w = FAVORITES_WRITE.lock().unwrap();
+    let snap = FAVORITES.lock().unwrap().clone();
+    write_json_atomic(&favorites_path(), &snap);
 }
 
 static FAVORITES: LazyLock<Mutex<Vec<FavoritePlace>>> =
@@ -667,16 +693,18 @@ async fn add_favorite(path: String) -> Result<(), String> {
             .map(|n| n.to_string_lossy().to_string())
             // ドライブ直下やネットワーク共有の直下はファイル名が取れないのでパスを名前にする。
             .unwrap_or_else(|| path.clone());
-        let mut list = FAVORITES.lock().unwrap();
-        if list.iter().any(|f| f.path == path) {
-            return;
+        {
+            let mut list = FAVORITES.lock().unwrap();
+            if list.iter().any(|f| f.path == path) {
+                return;
+            }
+            list.push(FavoritePlace {
+                path,
+                name,
+                added_at: now_epoch_secs(),
+            });
         }
-        list.push(FavoritePlace {
-            path,
-            name,
-            added_at: now_epoch_secs(),
-        });
-        persist_favorites(&list);
+        persist_favorites();
     })
     .await
     .map_err(|e| e.to_string())
@@ -686,9 +714,8 @@ async fn add_favorite(path: String) -> Result<(), String> {
 #[tauri::command]
 async fn remove_favorite(path: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let mut list = FAVORITES.lock().unwrap();
-        list.retain(|f| f.path != path);
-        persist_favorites(&list);
+        FAVORITES.lock().unwrap().retain(|f| f.path != path);
+        persist_favorites();
     })
     .await
     .map_err(|e| e.to_string())
@@ -709,18 +736,20 @@ async fn add_to_shelf(anchor: String, page: usize) -> Result<(), String> {
             .map(|t| base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &*t))
             .unwrap_or_default(); // 絵が作れなくても登録は成立させる
         let file_name = anchor_display_name(&anchor);
-        let mut list = SHELF.lock().unwrap();
-        if let Some(existing) = list.iter_mut().find(|s| s.anchor == anchor) {
-            existing.thumb_base64 = thumb_base64;
-        } else {
-            list.push(ShelfItem {
-                anchor,
-                file_name,
-                thumb_base64,
-                added_at: now_epoch_secs(),
-            });
+        {
+            let mut list = SHELF.lock().unwrap();
+            if let Some(existing) = list.iter_mut().find(|s| s.anchor == anchor) {
+                existing.thumb_base64 = thumb_base64;
+            } else {
+                list.push(ShelfItem {
+                    anchor,
+                    file_name,
+                    thumb_base64,
+                    added_at: now_epoch_secs(),
+                });
+            }
         }
-        persist_shelf(&list);
+        persist_shelf();
         Ok(())
     })
     .await
@@ -811,18 +840,20 @@ async fn add_path_to_shelf(path: String) -> Result<(), String> {
             base64::Engine::encode(&base64::engine::general_purpose::STANDARD, out.get_ref());
 
         let file_name = anchor_display_name(&anchor);
-        let mut list = SHELF.lock().unwrap();
-        if let Some(existing) = list.iter_mut().find(|s| s.anchor == anchor) {
-            existing.thumb_base64 = thumb_base64;
-        } else {
-            list.push(ShelfItem {
-                anchor,
-                file_name,
-                thumb_base64,
-                added_at: now_epoch_secs(),
-            });
+        {
+            let mut list = SHELF.lock().unwrap();
+            if let Some(existing) = list.iter_mut().find(|s| s.anchor == anchor) {
+                existing.thumb_base64 = thumb_base64;
+            } else {
+                list.push(ShelfItem {
+                    anchor,
+                    file_name,
+                    thumb_base64,
+                    added_at: now_epoch_secs(),
+                });
+            }
         }
-        persist_shelf(&list);
+        persist_shelf();
         Ok(())
     })
     .await
@@ -832,12 +863,8 @@ async fn add_path_to_shelf(path: String) -> Result<(), String> {
 #[tauri::command]
 async fn remove_from_shelf(anchor: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let snapshot = {
-            let mut list = SHELF.lock().unwrap();
-            list.retain(|s| s.anchor != anchor);
-            list.clone()
-        };
-        persist_shelf(&snapshot);
+        SHELF.lock().unwrap().retain(|s| s.anchor != anchor);
+        persist_shelf();
     })
     .await
     .map_err(|e| e.to_string())
@@ -2898,6 +2925,35 @@ mod tests {
         assert!(matches!(detect_format("b.CBR"), Ok(Format::Rar)));
         assert!(matches!(detect_format("c.7z"), Ok(Format::SevenZ)));
         assert!(detect_format("d.txt").is_err());
+    }
+
+    /// 保存先：テストでは実際の保存先（%APPDATA%\MameViewer）を使わないこと。
+    /// 使うと、しおりのテストが利用者の bookmarks.json を空にしてしまう（実際に起きていた）。
+    #[test]
+    fn test_data_never_touches_real_appdata() {
+        let dir = data_dir();
+        assert!(dir.starts_with(std::env::temp_dir()), "テストの保存先は一時フォルダ");
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            assert!(!dir.starts_with(&appdata), "実際の保存先を使わない");
+        }
+        assert!(bookmarks_path().starts_with(&dir));
+        assert!(shelf_path().starts_with(&dir));
+        assert!(history_path().starts_with(&dir));
+    }
+
+    /// 保存：一時ファイル経由で置き換え、途中のファイルを残さないこと。
+    #[test]
+    fn json_is_written_atomically() {
+        let dir = std::env::temp_dir().join("mviewer_atomic_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("x.json");
+        write_json_atomic(&path, &vec![1, 2, 3]);
+        write_json_atomic(&path, &vec![4, 5]); // 既存ファイルの置き換え
+        let back: Vec<i32> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(back, vec![4, 5]);
+        assert!(!path.with_extension("json.tmp").exists(), "一時ファイルが残らない");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// アンカーの「下層込み」の印：実在パスの取り出しと表示名。
