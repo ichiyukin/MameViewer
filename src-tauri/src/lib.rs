@@ -2651,10 +2651,17 @@ async fn read_text_file(path: String) -> Result<String, String> {
 /// これらはRust側のページ一覧を使わないため、閉じずに残すと
 /// サムネイル一覧・しおりの絵・同梱テキストが「前の本のもの」になる。
 #[tauri::command]
-async fn close_archive() {
-    tauri::async_runtime::spawn_blocking(|| {
+async fn close_archive(seq: Option<u64>) {
+    tauri::async_runtime::spawn_blocking(move || {
         {
             let mut guard = ARCHIVE.lock().unwrap();
+            // 閉じる指示を出した後に別の本が開かれていたら、その本を閉じない。
+            // （開く側の確定も同じロックの中で番号を確かめているので、食い違わない）
+            if let Some(s) = seq {
+                if OPEN_SEQ.load(AtomicOrd::Relaxed) != s {
+                    return;
+                }
+            }
             *guard = None;
             THUMB_GEN.fetch_add(1, AtomicOrd::Relaxed); // 動作中の事前生成を止める
         }

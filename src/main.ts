@@ -1586,9 +1586,12 @@ async function openTextFile(path: string, reset = false, seq = beginOpenRequest(
   resumeDialog.classList.add("hidden");
   try {
     invoke("note_open_seq", { seq }).catch(() => {}); // PDFと同じ理由
-    await invoke("close_archive").catch(() => {}); // 前の本の絵・一覧を引き継がせない
     const body = await invoke<string>("read_text_file", { path });
     if (!isCurrentOpen(seq)) return; // 読み込み中に別のファイルが開かれた
+    // 読めてから前の本を閉じる（絵・一覧を引き継がせないため）。先に閉じると、
+    // 読めなかった時（大きすぎる等）に画面は前の本のまま中身だけが消え、めくれなくなる。
+    await invoke("close_archive", { seq }).catch(() => {});
+    if (!isCurrentOpen(seq)) return;
     textSource = body;
     textIsMarkdown = extOf(path) === "md";
     releasePdf(); // PDF以外へ移るのでワーカーとバッファを解放する
@@ -2126,6 +2129,9 @@ function buildTreeLevel(entries: TreeEntry[]): HTMLElement {
 }
 
 function renderTree() {
+  // 「場所」一覧を出している間は描かない。遅いフォルダの取得が後から届いて
+  // ここへ来ると、先に消してから抜けるため、場所一覧が空欄になってしまう。
+  if (treeAtPlaces) return;
   treeScrollEl.innerHTML = "";
   if (!treeRootDir) return;
   const rootEntries = cachedTreeEntries(treeRootDir);
@@ -2297,7 +2303,9 @@ function buildPathInputRow(): HTMLElement {
   const err = document.createElement("div");
   err.className = "tree-path-error hidden";
   const submit = async () => {
-    const path = input.value.trim();
+    // エクスプローラーの「パスのコピー」は "C:\…" のように二重引用符で囲まれる。
+    // そのまま貼ると存在しない扱いになるので、両端の引用符は外す。
+    const path = input.value.trim().replace(/^"(.*)"$/, "$1").trim();
     if (!path) return;
     err.classList.add("hidden");
     go.disabled = true;
@@ -2330,6 +2338,9 @@ async function setTreeRoot(dir: string, highlightPath: string | null) {
   treeRootPathEl.title = dir;
   renderTree(); // 読み込み中表示を即座に見せる
   await fetchTreeDir(dir);
+  // 取得している間に別の場所へ移っていたら、この結果では描かない
+  // （「上へ」ボタンの状態も、移った先のものを上書きしてしまう）。
+  if (treeAtPlaces || treeRootDir !== dir) return;
   // ドライブ直下（親が無い）でも「場所」一覧へ抜けられるので、上へは常に押せる。
   treeUpBtn.disabled = false;
   renderTree();
@@ -2658,16 +2669,27 @@ async function openPdf(path: string, reset = false, seq = beginOpenRequest()) {
     // 実際に開くコマンドを呼ばないので、番号だけ先にRustへ伝える
     // （追い越されたアーカイブ読み込みをRust側でも捨てられるようにするため）。
     invoke("note_open_seq", { seq }).catch(() => {});
-    // 前のアーカイブを閉じる。残したままだとサムネイル一覧・しおりの絵・
-    // 同梱テキストが「前の本のもの」になる。
-    await invoke("close_archive").catch(() => {});
     const lib = await loadPdfLib();
     const buf = await invoke<ArrayBuffer>("read_file_bytes", { path });
     const task = lib.getDocument({ data: new Uint8Array(buf) }) as unknown as PdfLoadingTask;
-    const doc = (await task.promise) as PdfDoc;
+    let doc: PdfDoc;
+    try {
+      doc = (await task.promise) as PdfDoc;
+    } catch (err) {
+      await task.destroy().catch(() => {}); // 壊れたPDFでもワーカーを残さない
+      throw err;
+    }
     if (!isCurrentOpen(seq)) {
       // 読み込み中に別のファイルが開かれた。開いたワーカーとPDF全体の
       // バッファを解放してから抜ける（放置するとスレッドが漏れる）。
+      await task.destroy().catch(() => {});
+      return;
+    }
+    // 読めてから前のアーカイブを閉じる。残したままだとサムネイル一覧・しおりの絵・
+    // 同梱テキストが「前の本のもの」になる。先に閉じると、壊れたPDFを開こうとした
+    // だけで、画面は前の本のまま中身が消えてめくれなくなる。
+    await invoke("close_archive", { seq }).catch(() => {});
+    if (!isCurrentOpen(seq)) {
       await task.destroy().catch(() => {});
       return;
     }
@@ -3846,10 +3868,11 @@ window.addEventListener(
       return;
     }
     // S1（サイド奥ボタン）を押しながら、またはCtrlを押しながらのホイールはズーム。
+    // タッチパッドのピンチもCtrl付きのホイールとして届く。
     if (s1Down || e.ctrlKey) {
       e.preventDefault();
       if (s1Down) s1UsedForZoom = true;
-      zoomAt(e.clientX, e.clientY, e.deltaY < 0 ? ZOOM_WHEEL_STEP : 1 / ZOOM_WHEEL_STEP);
+      zoomAt(e.clientX, e.clientY, wheelZoomFactor(e));
       return;
     }
     // S2（サイド手前ボタン）を押しながらのホイールは巻送り。
@@ -3859,11 +3882,56 @@ window.addEventListener(
       else if (e.deltaY < 0) goPrevVolume();
       return;
     }
-    if (e.deltaY > 0) turnPage(1);
-    else if (e.deltaY < 0) turnPage(-1);
+    const steps = wheelPageSteps(e);
+    for (let i = 0; i < Math.abs(steps); i++) turnPage(steps > 0 ? 1 : -1);
   },
   { passive: false }
 );
+
+// ---- ホイール量の扱い ----
+// マウスのホイールは1ノッチで大きな量（ピクセル換算で100前後）が1回届く。
+// 一方タッチパッドは、1回なぞるだけで細かい量のイベントが数十回届く。
+// 1イベント＝1ページにすると、タッチパッドでは一度なぞっただけで数十ページ飛び、
+// 巻末を越えて次の巻まで進んでしまう。そこで、大きな量は従来どおり1回で1ページ、
+// 細かい量は溜めて「1ノッチ分」に達するごとに1ページ、とする。
+// （マウスの操作感は変えず、タッチパッドだけを量に比例させる）
+const WHEEL_NOTCH = 100; // 1ノッチ相当の量（ピクセル換算）
+const WHEEL_NOTCH_MIN = 50; // これ以上は1回でマウスの1ノッチとみなす
+let wheelAcc = 0;
+let wheelLastAt = 0;
+
+/// ホイール量をピクセル換算にそろえる（行単位・ページ単位で届く環境もあるため）。
+function wheelPixels(e: WheelEvent): number {
+  if (e.deltaMode === 1) return e.deltaY * 33; // 行単位
+  if (e.deltaMode === 2) return e.deltaY * WHEEL_NOTCH; // ページ単位
+  return e.deltaY;
+}
+
+/// このイベントで送るページ数（符号付き）。
+function wheelPageSteps(e: WheelEvent): number {
+  const dy = wheelPixels(e);
+  if (dy === 0) return 0;
+  if (Math.abs(dy) >= WHEEL_NOTCH_MIN) {
+    wheelAcc = 0;
+    return Math.sign(dy); // マウスの1ノッチ：従来どおり1ページ
+  }
+  const now = performance.now();
+  // 向きが変わった／間が空いた時は溜まった端数を捨てる（前の操作を持ち越さない）
+  if (now - wheelLastAt > 250 || Math.sign(dy) !== Math.sign(wheelAcc)) wheelAcc = 0;
+  wheelLastAt = now;
+  wheelAcc += dy;
+  const steps = Math.trunc(wheelAcc / WHEEL_NOTCH);
+  wheelAcc -= steps * WHEEL_NOTCH;
+  return steps;
+}
+
+/// ズームの倍率。マウスの1ノッチは従来どおり1段、細かい量（ピンチ等）は量に比例させる。
+/// 比例させないと、ピンチ1回で数十段ぶん拡大され、一瞬で最大倍率に張り付く。
+function wheelZoomFactor(e: WheelEvent): number {
+  const dy = wheelPixels(e);
+  if (Math.abs(dy) >= WHEEL_NOTCH_MIN) return dy < 0 ? ZOOM_WHEEL_STEP : 1 / ZOOM_WHEEL_STEP;
+  return Math.pow(ZOOM_WHEEL_STEP, -dy / WHEEL_NOTCH);
+}
 
 // UI領域（バー・メニュー・一覧・案内）上のクリックはページ送りに使わない
 function onUi(e: Event): boolean {
