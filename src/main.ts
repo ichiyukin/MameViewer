@@ -27,6 +27,23 @@ let shelfOpen = false;
 // 履歴・巻移動。currentAnchor は今開いている「巻」の識別パス
 // （アーカイブファイルなら自身のパス、フォルダ/単独画像ならフォルダの基点パス）。
 let currentAnchor: string | null = null;
+
+// フォルダを「下層も含めて」開くと、同じフォルダでもページの並びと総数が変わる。
+// 読書位置やしおりが別のページを指してしまうため、アンカーの末尾にこの印を付けて
+// 別の本として扱う。`|` はWindowsのファイル名に使えないので実在のパスと衝突しない。
+// （Rust側の RECURSIVE_MARK と同じ文字列。変える時は両方を合わせる。）
+const RECURSIVE_MARK = "|下層込み";
+
+/// アンカーから実在するパスの部分を取り出す（印を外す）。
+function anchorPath(anchor: string): string {
+  return anchor.endsWith(RECURSIVE_MARK)
+    ? anchor.slice(0, -RECURSIVE_MARK.length)
+    : anchor;
+}
+
+function isRecursiveAnchor(anchor: string): boolean {
+  return anchor.endsWith(RECURSIVE_MARK);
+}
 let endBehavior: "loop" | "next" = "loop"; // 巻末に達した時の挙動
 let saveTimer: number | undefined;
 
@@ -1550,7 +1567,7 @@ async function updateCurrentFileName() {
   }
   // PDFとテキストはRust側にページ一覧が無いので、ファイル自体の名前を出す。
   if (pageSource !== "archive") {
-    const name = currentAnchor ? basenameOf(currentAnchor) : "";
+    const name = currentAnchor ? basenameOf(anchorPath(currentAnchor)) : "";
     currentFileEl.textContent = name;
     currentFileEl.title = name;
     return;
@@ -1680,7 +1697,10 @@ function flushPositionSave() {
 
 // ウインドウタイトルに現在読み込んでいるファイル（アーカイブ/フォルダ）名を表示する。
 function updateWindowTitle() {
-  const title = currentAnchor ? `MameViewer - ${basenameOf(currentAnchor)}` : "MameViewer";
+  const title = currentAnchor
+    ? `MameViewer - ${basenameOf(anchorPath(currentAnchor))}` +
+      (isRecursiveAnchor(currentAnchor) ? "（下層込み）" : "")
+    : "MameViewer";
   getCurrentWindow()
     .setTitle(title)
     .catch(() => {}); // タイトル設定に失敗しても表示には影響しないため無視
@@ -2139,8 +2159,10 @@ async function setTreeRoot(dir: string, highlightPath: string | null) {
 // 開いたファイル／フォルダ（アンカー）に応じてツリーの起点を更新する。
 // アンカー自身の親フォルダを起点にし、アンカー自身をハイライトする。
 async function setTreeRootForAnchor(anchor: string) {
-  const parent = await invoke<string | null>("get_parent_dir", { path: anchor }).catch(() => null);
-  await setTreeRoot(parent ?? anchor, anchor);
+  // ツリーは実在するパスしか扱えないので印を外す。
+  const real = anchorPath(anchor);
+  const parent = await invoke<string | null>("get_parent_dir", { path: real }).catch(() => null);
+  await setTreeRoot(parent ?? real, real);
 }
 
 async function goTreeUp() {
@@ -2371,22 +2393,33 @@ async function openArchive(path: string, reset = false, seq = beginOpenRequest()
 // 画像ファイルなら、その親フォルダの画像を一覧化してその位置から表示する。
 // フォルダなら、その中の画像を先頭から表示する。サブフォルダがあれば、
 // 含めて読み込むかを確認する。reset=true の場合は先頭ページから開く。
-async function openImageOrFolder(path: string, reset = false, seq = beginOpenRequest()) {
+/// recursiveOverride を渡すと「下層も読み込むか」を確認せずその値で開く
+/// （しおり・本棚・前回の続きから開く場合。選択は記録済みのため）。
+async function openImageOrFolder(
+  path: string,
+  reset = false,
+  seq = beginOpenRequest(),
+  recursiveOverride?: boolean
+) {
   stopProgressPolling(); // 前のファイルの進捗表示が残らないようにする
   resumeDialog.classList.add("hidden"); // 再開確認ダイアログが出ていても、新規に開く操作を優先する
   try {
-    const hasSubs = await invoke<boolean>("has_subfolders", { path });
-    let recursive = false;
-    if (hasSubs) {
-      recursive = await ask(
-        "このフォルダには下層フォルダがあります。中の画像も読み込みますか？",
-        { title: "MameViewer", kind: "info" }
-      );
+    let recursive = recursiveOverride ?? false;
+    if (recursiveOverride === undefined) {
+      const hasSubs = await invoke<boolean>("has_subfolders", { path });
+      if (hasSubs) {
+        recursive = await ask(
+          "このフォルダには下層フォルダがあります。中の画像も読み込みますか？",
+          { title: "MameViewer", kind: "info" }
+        );
+      }
     }
-    const res = await invoke<{ count: number; initialIndex: number; dir: string }>(
-      "open_folder",
-      { path, recursive, reset, seq }
-    );
+    const res = await invoke<{
+      count: number;
+      initialIndex: number;
+      dir: string;
+      anchor: string;
+    }>("open_folder", { path, recursive, reset, seq });
     if (!isCurrentOpen(seq)) return; // 読み込み中に別のファイルが開かれた
     archiveGen++;
     releasePdf(); // PDF以外へ移るのでワーカーとバッファを解放する
@@ -2394,7 +2427,7 @@ async function openImageOrFolder(path: string, reset = false, seq = beginOpenReq
     resetPageCache();
     pageCount = res.count;
     current = res.initialIndex;
-    currentAnchor = res.dir;
+    currentAnchor = res.anchor; // 下層込みなら印が付く（別の本として記憶する）
     updateWindowTitle();
     if (shelfOpen) updateShelfAddBtnUi(); // 別の本を開いたら追加/削除の表示を切り替える
     loadBookmarkedPages(); // この本のしおり位置をまとめて取得（以後はIPCなしで判定）
@@ -2489,22 +2522,28 @@ async function openPdf(path: string, reset = false, seq = beginOpenRequest()) {
 }
 
 // 拡張子からアーカイブ／PDF／テキスト／画像・フォルダのどの開き方をすべきか振り分ける。
-async function openPath(path: string, reset = false) {
+/// fromAnchor=true のときは、しおり・本棚・前回の続きから開く場合。
+/// この場合はフォルダの「下層も読み込むか」が既に決まっているので確認しない
+/// （確認を挟むと、記録した時と違う選択をされてページ番号が食い違う）。
+async function openPath(path: string, reset = false, fromAnchor = false) {
+  // 印はディスク上に存在しないので、実際に開くパスからは外しておく。
+  const real = fromAnchor ? anchorPath(path) : path;
+  const recursive = fromAnchor ? isRecursiveAnchor(path) : undefined;
   // ネットワーク上の大きなファイルは開き終わるまで数十秒かかることがある。
   // その間、選択したことが画面に出ないと「押しても反応しない」と見えるため、
   // 待ちに入る前に、選んだ項目と読み込み中であることを先に表示する。
   const seq = beginOpenRequest();
-  beginOpening(path, seq);
+  beginOpening(real, seq);
   try {
-    const ext = extOf(path);
+    const ext = extOf(real);
     if (ARCHIVE_EXTS.includes(ext)) {
-      await openArchive(path, reset, seq);
+      await openArchive(real, reset, seq);
     } else if (ext === "pdf") {
-      await openPdf(path, reset, seq);
+      await openPdf(real, reset, seq);
     } else if (TEXT_EXTS.includes(ext)) {
-      await openTextFile(path, reset, seq);
+      await openTextFile(real, reset, seq);
     } else {
-      await openImageOrFolder(path, reset, seq);
+      await openImageOrFolder(real, reset, seq, recursive);
     }
   } finally {
     endOpening(seq); // 自分が出した表示だけを消す
@@ -2638,7 +2677,8 @@ async function goVolume(dir: 1 | -1, landAtEnd = false, fromStart = false) {
   volumeMoving = true;
   try {
     const volumes = await invoke<string[]>("list_volumes", { anchor: currentAnchor });
-    const idx = volumes.indexOf(currentAnchor);
+    // 一覧は実在パス。アンカーに印が付いている場合は外して突き合わせる。
+    const idx = volumes.indexOf(anchorPath(currentAnchor));
     if (idx < 0) return;
     const nextIdx = idx + dir;
     if (nextIdx < 0 || nextIdx >= volumes.length) return;
@@ -2646,7 +2686,7 @@ async function goVolume(dir: 1 | -1, landAtEnd = false, fromStart = false) {
     await openPath(target, fromStart);
     // 開けたかを確かめる。失敗しても openPath は例外を投げないため、
     // 確認せずに進めると「読んでいた本」が最終ページへ飛んでしまう。
-    if (landAtEnd && currentAnchor === target && pageCount > 0) {
+    if (landAtEnd && currentAnchor !== null && anchorPath(currentAnchor) === target && pageCount > 0) {
       current = pageCount - 1;
       schedulePositionSave();
       render();
@@ -3362,7 +3402,7 @@ async function buildShelfList() {
         // 開いたままだと画面下部が塞がり、パン操作の邪魔になるため）。
         cell.addEventListener("click", () => {
           toggleShelf(false);
-          openPath(item.anchor);
+          openPath(item.anchor, false, true); // 登録時の「下層込み」の選択をそのまま使う
         });
       }
       cell.append(img, name, removeBtn);
@@ -3427,7 +3467,7 @@ document.querySelector<HTMLButtonElement>("#shelf-close")!.addEventListener("cli
 async function jumpToBookmark(bm: BookmarkView) {
   closeBookmarks();
   if (bm.anchor !== currentAnchor) {
-    await openPath(bm.anchor);
+    await openPath(bm.anchor, false, true); // しおりを付けた時と同じ開き方に揃える
     // 開けなかった場合にそのまま進めると、読んでいた本が別のページへ飛ぶ。
     if (currentAnchor !== bm.anchor) return;
   }
@@ -3874,7 +3914,9 @@ async function initHistoryAndResume() {
     }
     if (lastOpened) {
       const page = h.positions[lastOpened] ?? 0;
-      resumeName.textContent = basenameOf(lastOpened);
+      resumeName.textContent =
+        basenameOf(anchorPath(lastOpened)) +
+        (isRecursiveAnchor(lastOpened) ? "（下層込み）" : "");
       resumePage.textContent = String(page + 1);
       resumeDialog.classList.remove("hidden");
 
@@ -3882,12 +3924,12 @@ async function initHistoryAndResume() {
       const restartBtn = document.querySelector<HTMLButtonElement>("#resume-restart")!;
       continueBtn.onclick = () => {
         resumeDialog.classList.add("hidden");
-        openPath(lastOpened);
+        openPath(lastOpened, false, true); // 前回と同じ開き方（下層込みの有無）で
       };
       restartBtn.onclick = async () => {
         resumeDialog.classList.add("hidden");
         // openPath と同じ振り分けを使う（PDF・テキストを取りこぼさないため）。
-        await openPath(lastOpened, true);
+        await openPath(lastOpened, true, true);
       };
       // 「新しいファイル」＝ダイアログを閉じてファイル選択（旧キャンセルは実質これと同じ導線のため統合）。
       document.querySelector<HTMLButtonElement>("#resume-cancel")!.onclick = () => {

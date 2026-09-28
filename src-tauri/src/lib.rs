@@ -418,7 +418,7 @@ fn try_relink_bookmarks(new_path: &str) {
     let candidates: Vec<String> = {
         let list = BOOKMARKS.lock().unwrap();
         list.iter()
-            .filter(|b| b.anchor != new_path && b.file_name == name && b.file_size == size)
+            .filter(|b| anchor_path(&b.anchor) != new_path && b.file_name == name && b.file_size == size)
             .map(|b| b.anchor.clone())
             .collect()
     };
@@ -427,7 +427,7 @@ fn try_relink_bookmarks(new_path: &str) {
     }
     let missing: Vec<String> = candidates
         .into_iter()
-        .filter(|a| !Path::new(a).exists())
+        .filter(|a| !Path::new(anchor_path(a)).exists())
         .collect();
     if missing.is_empty() {
         return;
@@ -459,11 +459,8 @@ fn add_bookmark_sync(anchor: String, page: usize) -> Result<BookmarkView, String
     let thumb_base64 = make_thumbnail(page)
         .map(|t| base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &*t))
         .unwrap_or_default();
-    let file_name = Path::new(&anchor)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let file_size = std::fs::metadata(&anchor)
+    let file_name = anchor_display_name(&anchor);
+    let file_size = std::fs::metadata(anchor_path(&anchor))
         .ok()
         .filter(|m| !m.is_dir())
         .map(|m| m.len())
@@ -531,7 +528,7 @@ fn list_bookmarks_sync(anchor: Option<String>) -> Vec<BookmarkView> {
     picked
         .into_iter()
         .map(|b| BookmarkView {
-            exists: Path::new(&b.anchor).exists(),
+            exists: Path::new(anchor_path(&b.anchor)).exists(),
             id: b.id,
             anchor: b.anchor,
             page: b.page,
@@ -711,10 +708,7 @@ async fn add_to_shelf(anchor: String, page: usize) -> Result<(), String> {
         let thumb_base64 = make_thumbnail(page)
             .map(|t| base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &*t))
             .unwrap_or_default(); // 絵が作れなくても登録は成立させる
-        let file_name = Path::new(&anchor)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
+        let file_name = anchor_display_name(&anchor);
         let mut list = SHELF.lock().unwrap();
         if let Some(existing) = list.iter_mut().find(|s| s.anchor == anchor) {
             existing.thumb_base64 = thumb_base64;
@@ -805,10 +799,7 @@ async fn add_path_to_shelf(path: String) -> Result<(), String> {
         let thumb_base64 =
             base64::Engine::encode(&base64::engine::general_purpose::STANDARD, out.get_ref());
 
-        let file_name = Path::new(&anchor)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
+        let file_name = anchor_display_name(&anchor);
         let mut list = SHELF.lock().unwrap();
         if let Some(existing) = list.iter_mut().find(|s| s.anchor == anchor) {
             existing.thumb_base64 = thumb_base64;
@@ -850,7 +841,7 @@ async fn list_shelf() -> Result<Vec<ShelfItemView>, String> {
         items
             .into_iter()
             .map(|s| ShelfItemView {
-                exists: Path::new(&s.anchor).exists(),
+                exists: Path::new(anchor_path(&s.anchor)).exists(),
                 anchor: s.anchor,
                 file_name: s.file_name,
                 thumb_base64: s.thumb_base64,
@@ -901,6 +892,33 @@ const OPEN_SUPERSEDED: &str = "__superseded__";
 /// 読み込み中の進捗バーを表示する（プッシュ通知ではなくポーリング方式）。
 static THUMB_DONE: AtomicUsize = AtomicUsize::new(0);
 static THUMB_TOTAL: AtomicUsize = AtomicUsize::new(0);
+
+/// フォルダを「下層も含めて」開くと、同じフォルダでもページの並びと総数が変わる。
+/// 読書位置やしおりが別のページを指してしまうため、識別パス（アンカー）の末尾に
+/// この印を付けて別の本として扱う。`|` はWindowsのファイル名に使えない文字なので、
+/// 実在のパスと衝突しない。
+const RECURSIVE_MARK: &str = "|下層込み";
+
+/// アンカーから実在するパスの部分だけを取り出す（印を外す）。
+/// ファイルの存在確認・親フォルダの取得・巻の列挙など、
+/// 実際にディスクを触る処理では必ずこれを通す。
+fn anchor_path(anchor: &str) -> &str {
+    anchor.strip_suffix(RECURSIVE_MARK).unwrap_or(anchor)
+}
+
+/// しおり・本棚に並べる表示名。印はそのままでは記号が生々しいので、
+/// 「（下層込み）」と読める形に直す（同じフォルダの2通りを見分けるため）。
+fn anchor_display_name(anchor: &str) -> String {
+    let name = Path::new(anchor_path(anchor))
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if anchor.ends_with(RECURSIVE_MARK) {
+        format!("{name}（下層込み）")
+    } else {
+        name
+    }
+}
 
 /// 対応画像拡張子か判定。
 fn is_image(name: &str) -> bool {
@@ -1256,7 +1274,8 @@ async fn get_file_size(path: String) -> u64 {
 /// 再開確認で「もう無い本」を勧めないために使う。
 #[tauri::command]
 async fn path_exists(path: String) -> bool {
-    tauri::async_runtime::spawn_blocking(move || Path::new(&path).exists())
+    // アンカー（印が付いていることがある）を受け取るので外してから確かめる。
+    tauri::async_runtime::spawn_blocking(move || Path::new(anchor_path(&path)).exists())
         .await
         .unwrap_or(false)
 }
@@ -1336,7 +1355,8 @@ async fn list_tree_dir(path: String) -> Result<Vec<TreeEntry>, String> {
 /// path の親フォルダのパスを返す（ツリーの「上へ」ボタン用）。無ければNone。
 #[tauri::command]
 fn get_parent_dir(path: String) -> Option<String> {
-    Path::new(&path)
+    // アンカーを渡されることがあるので印を外してから辿る。
+    Path::new(anchor_path(&path))
         .parent()
         .filter(|p| p.as_os_str().len() > 0)
         .map(|p| p.to_string_lossy().to_string())
@@ -1396,6 +1416,7 @@ fn is_archive_ext(path: &str) -> bool {
 /// 「巻」として開けるもの（アーカイブファイル・サブフォルダ）を自然順で列挙する。
 /// 巻移動（前の巻/次の巻）はこの一覧の中を前後に辿る。
 fn list_volumes_sync(anchor: &str) -> Result<Vec<String>, String> {
+    let anchor = anchor_path(anchor);
     let p = PathBuf::from(anchor);
     let parent = p
         .parent()
@@ -2374,8 +2395,10 @@ struct FolderOpenResult {
     count: usize,
     #[serde(rename = "initialIndex")]
     initial_index: usize,
-    /// この巻を識別するパス（＝フォルダの基点パス）。history/巻移動で使う。
+    /// 基点フォルダの実在パス。ツリーの選択位置や巻移動の基準に使う。
     dir: String,
+    /// この巻を識別するパス。下層込みで開いた場合は印が付く（history/しおり用）。
+    anchor: String,
 }
 
 /// 画像ファイル、またはフォルダそのものを開く。
@@ -2397,7 +2420,13 @@ async fn open_folder(
         let p = PathBuf::from(&path);
         let focus = if p.is_dir() { None } else { Some(p.clone()) };
         let dir = resolve_base_dir(&p)?;
-        let anchor = dir.to_string_lossy().to_string();
+        let dir_str = dir.to_string_lossy().to_string();
+        // 下層込みで開いた場合は、同じフォルダでも別の本として位置を記憶する。
+        let anchor = if recursive {
+            format!("{dir_str}{RECURSIVE_MARK}")
+        } else {
+            dir_str.clone()
+        };
 
         let mut entries = list_folder(&dir, recursive)?;
         if entries.is_empty() {
@@ -2450,7 +2479,8 @@ async fn open_folder(
         Ok(FolderOpenResult {
             count,
             initial_index,
-            dir: anchor,
+            dir: dir_str,
+            anchor,
         })
     })
     .await
@@ -2784,6 +2814,21 @@ mod tests {
         assert!(matches!(detect_format("b.CBR"), Ok(Format::Rar)));
         assert!(matches!(detect_format("c.7z"), Ok(Format::SevenZ)));
         assert!(detect_format("d.txt").is_err());
+    }
+
+    /// アンカーの「下層込み」の印：実在パスの取り出しと表示名。
+    /// 下層を含めて開くと総ページ数が変わるため、同じフォルダでも
+    /// 別の本として位置・しおりを記憶する必要がある。
+    #[test]
+    fn recursive_anchor_marker_round_trips() {
+        // 区切りは検証に関係しないので、エスケープの無い形で書く。
+        let plain = "C:/本/作品";
+        let marked = format!("{plain}{RECURSIVE_MARK}");
+        assert_eq!(anchor_path(plain), plain, "印が無ければそのまま");
+        assert_eq!(anchor_path(&marked), plain, "印を外すと実在パスになる");
+        assert_eq!(anchor_display_name(plain), "作品");
+        assert_eq!(anchor_display_name(&marked), "作品（下層込み）");
+        assert_ne!(plain, marked.as_str(), "別の本として区別されること");
     }
 
     /// 巻移動：同フォルダ内の「開けるもの」が自然順で列挙されること。
