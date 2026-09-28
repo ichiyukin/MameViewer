@@ -1500,7 +1500,8 @@ body {
   background: var(--accent);
   color: var(--accent-text);
 }
-#bm-clear-broken {
+#bm-clear-broken,
+#shelf-clear-broken {
   padding: 6px 12px;
   font-size: 0.82rem;
   font-family: inherit;
@@ -1509,7 +1510,8 @@ body {
   border: none;
   cursor: pointer;
 }
-#bm-clear-broken.hidden {
+#bm-clear-broken.hidden,
+#shelf-clear-broken.hidden {
   display: none;
 }
 #bookmarks-close {

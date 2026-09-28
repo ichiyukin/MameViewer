@@ -1389,11 +1389,114 @@ function renderPlainText(src: string): string {
     .join("");
 }
 
+// ---- 本文の読み位置（文字位置で持つ） ----
+// 本文のページ数は画面幅と文字サイズで変わる。ページ番号で位置を覚えると、
+// 窓の大きさを変えただけで読書位置としおりが別の場所を指してしまう。
+// そこで「先頭から何文字目か」で記録し、表示のたびに今のページ番号へ換算する。
+// 換算表は、一定間隔の文字が組版後にどの段（＝ページ）へ落ちたかを
+// 範囲(Range)の座標で測って作る（本文自体は一切書き換えない）。
+const TEXT_SAMPLE_MIN_STEP = 80; // 測る間隔（文字）＝戻れる位置の細かさ
+const TEXT_SAMPLE_MAX_COUNT = 4000; // 測る回数の上限（長文で時間がかかり過ぎないように）
+let textNodes: { node: Text; start: number }[] = [];
+let textCharTotal = 0;
+let textPageOffsets: number[] = []; // ページ番号 -> そのページ先頭の文字位置
+
+/// 本文中のテキストノードを、先頭から何文字目かと一緒に並べて控える。
+/// buildTextView で本文を差し込んだ直後に呼ぶ（以後は本文を書き換えない）。
+function collectTextNodes() {
+  const walker = document.createTreeWalker(textviewBody, NodeFilter.SHOW_TEXT);
+  const nodes: { node: Text; start: number }[] = [];
+  let total = 0;
+  for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+    const t = n as Text;
+    if (t.length === 0) continue;
+    nodes.push({ node: t, start: total });
+    total += t.length;
+  }
+  textNodes = nodes;
+  textCharTotal = total;
+}
+
+/// 指定の文字位置が今どこに組まれているかを測る（本文枠の左端からのx座標）。
+/// 目印の要素を挟む方法だと組版に影響し得るため、範囲(Range)の位置を読む。
+function measureXForOffset(off: number, bodyLeft: number): number | null {
+  // 二分探索でその文字を含むノードを見つける。
+  let lo = 0;
+  let hi = textNodes.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (textNodes[mid].start <= off) lo = mid;
+    else hi = mid - 1;
+  }
+  const entry = textNodes[lo];
+  if (!entry) return null;
+  const k = Math.min(off - entry.start, entry.node.length - 1);
+  if (k < 0) return null;
+  const range = document.createRange();
+  range.setStart(entry.node, k);
+  range.setEnd(entry.node, k + 1);
+  const rect = range.getBoundingClientRect();
+  range.detach();
+  if (rect.width === 0 && rect.height === 0) return null; // 折り返しの隙間など
+  return rect.left - bodyLeft;
+}
+
+/// 「ページ番号 -> 先頭の文字位置」の表を作る。
+function computeTextPageOffsets(stride: number) {
+  textPageOffsets = new Array(Math.max(1, textPageTotal)).fill(-1);
+  textPageOffsets[0] = 0;
+  if (textCharTotal === 0) return;
+  const bodyLeft = textviewBody.getBoundingClientRect().left;
+  const step = Math.max(
+    TEXT_SAMPLE_MIN_STEP,
+    Math.ceil(textCharTotal / TEXT_SAMPLE_MAX_COUNT)
+  );
+  for (let off = 0; off < textCharTotal; off += step) {
+    const x = measureXForOffset(off, bodyLeft);
+    if (x === null) continue;
+    const p = Math.min(textPageTotal - 1, Math.max(0, Math.floor(x / stride)));
+    if (textPageOffsets[p] < 0) textPageOffsets[p] = off;
+  }
+  // 測れなかった／文字が載っていないページは、直前のページと同じ位置として扱う。
+  for (let i = 1; i < textPageOffsets.length; i++) {
+    if (textPageOffsets[i] < 0) textPageOffsets[i] = textPageOffsets[i - 1];
+  }
+}
+
+function textOffsetOfPage(page: number): number {
+  if (textPageOffsets.length === 0) return 0;
+  const p = Math.min(textPageOffsets.length - 1, Math.max(0, page));
+  return textPageOffsets[p];
+}
+
+function textPageOfOffset(off: number): number {
+  if (textPageOffsets.length === 0) return 0;
+  // 表は単調非減少。その文字位置を含む最後のページを返す。
+  let hit = 0;
+  for (let i = 0; i < textPageOffsets.length; i++) {
+    if (textPageOffsets[i] <= off) hit = i;
+    else break;
+  }
+  return hit;
+}
+
+/// 記録する値。画像は「ページ番号」、本文は「先頭から何文字目か」。
+function positionKeyOf(page: number): number {
+  return pageSource === "text" ? textOffsetOfPage(page) : page;
+}
+
+/// 記録された値から、今のレイアウトでのページ番号へ戻す。
+function pageOfPositionKey(key: number): number {
+  return pageSource === "text" ? textPageOfOffset(key) : key;
+}
+
 /// 本文を段組みし直して総ページ数を求める。画面サイズ・文字サイズの変更後に呼ぶ。
+/// 組み直すとページ番号の意味が変わるので、直前の文字位置を保って戻す。
 function layoutTextPages() {
   if (textview.classList.contains("hidden")) return;
   const w = textviewBody.clientWidth;
   if (w <= 0) return;
+  const keepOffset = textPageOffsets.length > 0 ? textOffsetOfPage(current) : 0;
   textviewBody.style.transform = "";
   textviewBody.style.columnWidth = `${w}px`;
   textviewBody.style.columnGap = `${TEXT_COLUMN_GAP}px`;
@@ -1402,7 +1505,10 @@ function layoutTextPages() {
   textPageTotal = Math.max(1, Math.round(textviewBody.scrollWidth / stride));
   pageCount = textPageTotal;
   seek.max = String(pageCount - 1);
-  if (current > pageCount - 1) current = pageCount - 1;
+  computeTextPageOffsets(stride);
+  // 幅が変われば同じ文字位置でもページ番号が変わる。番号ではなく位置で戻す。
+  current = Math.min(pageCount - 1, textPageOfOffset(keepOffset));
+  recomputeBookmarkedPages(); // しおりの点灯も新しいページ番号で取り直す
   showTextPage(current);
 }
 
@@ -1424,6 +1530,8 @@ function buildTextView() {
   textviewBody.innerHTML = textIsMarkdown
     ? renderMarkdown(textSource)
     : renderPlainText(textSource);
+  textPageOffsets = [];
+  collectTextNodes(); // 文字位置を測るための下準備（本文自体は書き換えない）
   // 段組みは実際の描画幅が要るため、レイアウト確定後に計算する。
   layoutTextPages();
   requestAnimationFrame(layoutTextPages);
@@ -1460,9 +1568,11 @@ async function openTextFile(path: string, reset = false, seq = beginOpenRequest(
     if (!reset) {
       const h = await invoke<{ positions: Record<string, number> }>("get_history");
       if (!isCurrentOpen(seq)) return; // 待っている間に別のファイルが開かれた
-      const saved = Math.min(h.positions[path] ?? 0, Math.max(0, pageCount - 1));
-      if (saved > 0) {
-        current = saved;
+      // 記録されているのは「先頭から何文字目か」。今の幅でのページ番号へ換算する。
+      const savedOffset = h.positions[path] ?? 0;
+      const page = Math.min(Math.max(0, pageCount - 1), textPageOfOffset(savedOffset));
+      if (page > 0) {
+        current = page;
         showTextPage(current);
       }
     }
@@ -1677,7 +1787,7 @@ function schedulePositionSave() {
   if (!currentAnchor) return;
   window.clearTimeout(saveTimer);
   const anchor = currentAnchor;
-  const page = current;
+  const page = positionKeyOf(current);
   // 読書中はページを次々に送るため、書き込みは最後の1回にまとめたい。
   // 0.5秒だと連続してめくる速さと競合して書き込み回数が増えるので、間隔を広げる
   // （途中で閉じた場合に失うのは直前のめくり1回分だけなので実害は小さい）。
@@ -1692,7 +1802,7 @@ function flushPositionSave() {
   window.clearTimeout(saveTimer);
   saveTimer = undefined;
   if (!currentAnchor) return;
-  invoke("save_position", { anchor: currentAnchor, page: current }).catch(() => {});
+  invoke("save_position", { anchor: currentAnchor, page: positionKeyOf(current) }).catch(() => {});
 }
 
 // ウインドウタイトルに現在読み込んでいるファイル（アーカイブ/フォルダ）名を表示する。
@@ -2404,15 +2514,19 @@ async function openImageOrFolder(
   stopProgressPolling(); // 前のファイルの進捗表示が残らないようにする
   resumeDialog.classList.add("hidden"); // 再開確認ダイアログが出ていても、新規に開く操作を優先する
   try {
+    const shape = await invoke<{ hasSubfolders: boolean; hasDirectImages: boolean }>(
+      "folder_shape",
+      { path }
+    );
     let recursive = recursiveOverride ?? false;
-    if (recursiveOverride === undefined) {
-      const hasSubs = await invoke<boolean>("has_subfolders", { path });
-      if (hasSubs) {
-        recursive = await ask(
-          "このフォルダには下層フォルダがあります。中の画像も読み込みますか？",
-          { title: "MameViewer", kind: "info" }
-        );
-      }
+    if (shape.hasSubfolders && !shape.hasDirectImages) {
+      // 直下に画像が無いので、下層を含めなければ1枚も開けない。尋ねる意味がない。
+      recursive = true;
+    } else if (recursiveOverride === undefined && shape.hasSubfolders) {
+      recursive = await ask(
+        "このフォルダには下層フォルダがあります。中の画像も読み込みますか？",
+        { title: "MameViewer", kind: "info" }
+      );
     }
     const res = await invoke<{
       count: number;
@@ -2528,7 +2642,7 @@ async function openPdf(path: string, reset = false, seq = beginOpenRequest()) {
 async function openPath(path: string, reset = false, fromAnchor = false) {
   // 印はディスク上に存在しないので、実際に開くパスからは外しておく。
   const real = fromAnchor ? anchorPath(path) : path;
-  const recursive = fromAnchor ? isRecursiveAnchor(path) : undefined;
+  const recursive = fromAnchor ? isRecursiveAnchor(path) : (inheritRecursive ?? undefined);
   // ネットワーク上の大きなファイルは開き終わるまで数十秒かかることがある。
   // その間、選択したことが画面に出ないと「押しても反応しない」と見えるため、
   // 待ちに入る前に、選んだ項目と読み込み中であることを先に表示する。
@@ -2668,6 +2782,9 @@ function endOpening(seq: number) {
 // 巻移動が重ならないようにする。端で連打すると複数の移動が同時に走り、
 // 最後に開いた本とは別の本の末尾を指してしまう。
 let volumeMoving = false;
+/// 巻移動の最中だけ、フォルダの「下層も読み込むか」をこの値で引き継ぐ。
+/// null の間は通常どおり（必要なら確認する）。
+let inheritRecursive: boolean | null = null;
 
 /// dir=1 で次の巻、-1 で前の巻へ。
 /// landAtEnd=true なら移動先の最終ページへ（遡って読み続ける時）。
@@ -2683,7 +2800,15 @@ async function goVolume(dir: 1 | -1, landAtEnd = false, fromStart = false) {
     const nextIdx = idx + dir;
     if (nextIdx < 0 || nextIdx >= volumes.length) return;
     const target = volumes[nextIdx];
-    await openPath(target, fromStart);
+    // 巻移動は読み進めている流れの途中。ここで「下層も読み込むか」を尋ねると
+    // 流れが止まるので、今読んでいる巻と同じ選択を引き継ぐ
+    // （直下に画像が無いフォルダは、開く側が自動で下層込みにする）。
+    inheritRecursive = isRecursiveAnchor(currentAnchor);
+    try {
+      await openPath(target, fromStart);
+    } finally {
+      inheritRecursive = null;
+    }
     // 開けたかを確かめる。失敗しても openPath は例外を投げないため、
     // 確認せずに進めると「読んでいた本」が最終ページへ飛んでしまう。
     if (landAtEnd && currentAnchor !== null && anchorPath(currentAnchor) === target && pageCount > 0) {
@@ -3295,24 +3420,34 @@ const bmClearBrokenBtn = document.querySelector<HTMLButtonElement>("#bm-clear-br
 // （どこにしおりを挟んだかが一目で分かるように）。
 const bookmarkBtn = document.querySelector<HTMLButtonElement>("#bookmark-btn")!;
 
-// 現在の本のしおりページ番号。ページ送りのたびにRust側へ問い合わせると
-// IPC往復がページ数分積み重なるため、本を開いた時に一度だけ取得して保持する。
+// 現在の本のしおり。ページ送りのたびにRust側へ問い合わせるとIPC往復が
+// ページ数分積み重なるため、本を開いた時に一度だけ取得して保持する。
+// 記録値（画像=ページ番号／本文=文字位置）と、今のレイアウトでの表示ページを分けて持つ。
+// 本文は組み直すとページ番号が変わるため、表示ページの方は作り直す必要がある。
+let bookmarkedKeys = new Set<number>();
 let bookmarkedPages = new Set<number>();
+
+/// 記録値から今のページ番号を引き直す（本文の組み直し後・しおり取得後に呼ぶ）。
+function recomputeBookmarkedPages() {
+  bookmarkedPages = new Set([...bookmarkedKeys].map(pageOfPositionKey));
+  updateBookmarkBtnUi();
+}
 
 async function loadBookmarkedPages() {
   // 比較対象はローカルに控える。共有の変数どうしを比べると、後から始まった
   // 呼び出しが両方を書き換えてしまい、判定が永久に成立しない。
   const anchor = currentAnchor;
+  bookmarkedKeys = new Set();
   bookmarkedPages = new Set();
   if (!anchor) return;
   try {
     const list = await invoke<BookmarkView[]>("list_bookmarks", { anchor });
     if (anchor !== currentAnchor) return; // 取得中に別の本へ切り替わった
-    for (const b of list) bookmarkedPages.add(b.page);
+    for (const b of list) bookmarkedKeys.add(b.page);
   } catch (e) {
     console.error("しおり情報の取得に失敗:", e);
   }
-  updateBookmarkBtnUi();
+  recomputeBookmarkedPages();
 }
 
 function updateBookmarkBtnUi() {
@@ -3323,22 +3458,34 @@ function updateBookmarkBtnUi() {
     : "このページにしおりを挟むのだ (B)";
 }
 
+/// 今のページに対応する記録値。本文は、組み直しで文字位置が少しずれても
+/// 「このページに載っているしおり」を拾えるよう、既存の記録値を優先して返す。
+function bookmarkKeyForCurrentPage(): number {
+  if (pageSource === "text") {
+    for (const k of bookmarkedKeys) {
+      if (textPageOfOffset(k) === current) return k;
+    }
+  }
+  return positionKeyOf(current);
+}
+
 async function toggleBookmark() {
   if (!currentAnchor || pageCount === 0) return;
   try {
+    const key = bookmarkKeyForCurrentPage();
     const existingId = await invoke<number | null>("find_bookmark", {
       anchor: currentAnchor,
-      page: current,
+      page: key,
     });
     if (existingId != null) {
       await invoke("remove_bookmark", { id: existingId });
-      bookmarkedPages.delete(current);
+      bookmarkedKeys.delete(key);
     } else {
-      await invoke("add_bookmark", { anchor: currentAnchor, page: current });
-      bookmarkedPages.add(current);
+      await invoke("add_bookmark", { anchor: currentAnchor, page: key });
+      bookmarkedKeys.add(key);
     }
     if (bmOpen) await buildBookmarksList();
-    updateBookmarkBtnUi();
+    recomputeBookmarkedPages();
   } catch (e) {
     console.error("しおり操作に失敗:", e);
   }
@@ -3357,11 +3504,13 @@ interface ShelfItemView {
 const shelfEl = document.querySelector<HTMLDivElement>("#shelf")!;
 const shelfScrollEl = document.querySelector<HTMLDivElement>("#shelf-scroll")!;
 const shelfAddBtn = document.querySelector<HTMLButtonElement>("#shelf-add-btn")!;
+const shelfClearBrokenBtn = document.querySelector<HTMLButtonElement>("#shelf-clear-broken")!;
 
 async function buildShelfList() {
   try {
     const items = await invoke<ShelfItemView[]>("list_shelf");
     shelfScrollEl.innerHTML = "";
+    shelfClearBrokenBtn.classList.toggle("hidden", !items.some((i) => !i.exists));
     if (items.length === 0) {
       const empty = document.createElement("p");
       empty.className = "shelf-empty";
@@ -3446,6 +3595,24 @@ shelfAddBtn.addEventListener("click", async () => {
   }
 });
 
+// 見つからなくなった本をまとめて外す（しおり一覧と同じ導線）。
+// 外付けドライブやネットワークの本を並べていると、少しずつ死んだ項目が溜まるため。
+shelfClearBrokenBtn.addEventListener("click", async () => {
+  const items = await invoke<ShelfItemView[]>("list_shelf").catch(() => []);
+  const broken = items.filter((i) => !i.exists);
+  if (broken.length === 0) return;
+  const ok = await ask(`見つからない本 ${broken.length} 件を本棚から外します。よろしいですか？`, {
+    title: "MameViewer",
+    kind: "warning",
+  });
+  if (!ok) return;
+  for (const i of broken) {
+    await invoke("remove_from_shelf", { anchor: i.anchor }).catch(() => {});
+  }
+  await buildShelfList();
+  updateShelfAddBtnUi();
+});
+
 async function toggleShelf(force?: boolean) {
   shelfOpen = force ?? !shelfOpen;
   shelfEl.classList.toggle("hidden", !shelfOpen);
@@ -3471,7 +3638,19 @@ async function jumpToBookmark(bm: BookmarkView) {
     // 開けなかった場合にそのまま進めると、読んでいた本が別のページへ飛ぶ。
     if (currentAnchor !== bm.anchor) return;
   }
-  jump(bm.page);
+  jump(pageOfPositionKey(bm.page)); // 本文は文字位置で記録しているので今のページ番号へ換算
+}
+
+/// しおりの位置の見せ方。本文は文字位置で記録しているため、
+/// 今開いている本文ならページ番号へ換算し、そうでなければ文字位置のまま示す
+/// （別の本のページ数は、その本を開かないと分からない）。
+function bookmarkPositionLabel(bm: BookmarkView): string {
+  const isText = TEXT_EXTS.includes(extOf(anchorPath(bm.anchor)));
+  if (!isText) return `${bm.page + 1}ページ`;
+  if (bm.anchor === currentAnchor && pageSource === "text") {
+    return `${textPageOfOffset(bm.page) + 1}ページ`;
+  }
+  return `${bm.page + 1}文字目`;
 }
 
 function renderBookmarkCell(bm: BookmarkView): HTMLDivElement {
@@ -3492,7 +3671,7 @@ function renderBookmarkCell(bm: BookmarkView): HTMLDivElement {
   info.className = "bm-info";
   const name = document.createElement("span");
   name.className = "bm-name";
-  name.textContent = `${bm.fileName}　${bm.page + 1}ページ`;
+  name.textContent = `${bm.fileName}　${bookmarkPositionLabel(bm)}`;
   info.appendChild(name);
   cell.appendChild(info);
 

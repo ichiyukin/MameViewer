@@ -1362,15 +1362,36 @@ fn get_parent_dir(path: String) -> Option<String> {
         .map(|p| p.to_string_lossy().to_string())
 }
 
-/// dir 直下にサブフォルダが存在するか（非再帰・浅い確認）。
-fn has_subfolders_in(dir: &Path) -> Result<bool, String> {
+#[derive(serde::Serialize)]
+struct FolderShape {
+    /// 下層フォルダがあるか。
+    #[serde(rename = "hasSubfolders")]
+    has_subfolders: bool,
+    /// 直下に画像があるか。無い場合、下層を含めなければ1枚も開けない。
+    #[serde(rename = "hasDirectImages")]
+    has_direct_images: bool,
+}
+
+/// dir 直下を1回だけ走査して、下層フォルダと直下の画像の有無を調べる。
+fn folder_shape_of(dir: &Path) -> Result<FolderShape, String> {
+    let mut has_subfolders = false;
+    let mut has_direct_images = false;
     for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
-        if entry.path().is_dir() {
-            return Ok(true);
+        let p = entry.path();
+        if p.is_dir() {
+            has_subfolders = true;
+        } else if is_image(&p.to_string_lossy()) {
+            has_direct_images = true;
+        }
+        if has_subfolders && has_direct_images {
+            break; // 両方分かれば十分（枚数の多いフォルダを最後まで見ない）
         }
     }
-    Ok(false)
+    Ok(FolderShape {
+        has_subfolders,
+        has_direct_images,
+    })
 }
 
 /// フォルダ内の画像を列挙する（絶対パスの文字列で返す）。
@@ -2380,11 +2401,14 @@ fn read_page_bytes_uncached(index: usize) -> Result<Vec<u8>, String> {
 /// 指定パス（画像ファイル or フォルダ）の基点フォルダに、サブフォルダが
 /// 存在するかを調べる。フロント側で「下層フォルダも読み込みますか？」の
 /// 確認ダイアログを出すべきかどうかの判定に使う。
+/// フォルダの形を調べる。「下層も読み込みますか？」を尋ねるべきかの判断に使う。
+/// 直下に画像が無いフォルダでは尋ねる意味がない（含めなければ空になる）ので、
+/// 呼び出し側はそのまま下層込みで開く。
 #[tauri::command]
-async fn has_subfolders(path: String) -> Result<bool, String> {
+async fn folder_shape(path: String) -> Result<FolderShape, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let dir = resolve_base_dir(Path::new(&path))?;
-        has_subfolders_in(&dir)
+        folder_shape_of(&dir)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -2705,7 +2729,6 @@ pub fn run() {
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .invoke_handler(tauri::generate_handler![
             open_archive,
-            has_subfolders,
             open_folder,
             get_page,
             get_thumbnail,
@@ -2735,6 +2758,7 @@ pub fn run() {
             list_places,
             dir_exists,
             path_exists,
+            folder_shape,
             get_file_size,
             get_read_progress,
             get_page_name,
@@ -3054,10 +3078,9 @@ mod tests {
         std::fs::write(base.join("sub").join("c.png"), b"fake-c").unwrap();
         std::fs::write(base.join("sub").join("d.png"), b"fake-d").unwrap();
 
-        assert!(
-            has_subfolders_in(&base).expect("サブフォルダ確認"),
-            "sub フォルダがあるので true"
-        );
+        let shape = folder_shape_of(&base).expect("フォルダの形を調べる");
+        assert!(shape.has_subfolders, "sub フォルダがあるので true");
+        assert!(shape.has_direct_images, "直下に a.png があるので true");
 
         // 非再帰：トップレベルの2枚のみ。
         let mut nonrec = list_folder(&base, false).expect("非再帰一覧");
