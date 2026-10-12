@@ -2831,7 +2831,11 @@ async fn get_thumbnail(index: usize) -> Result<tauri::ipc::Response, String> {
 /// （exe自身のパスを除く最初のコマンドライン引数）。
 #[tauri::command]
 fn get_launch_path() -> Option<String> {
-    std::env::args().nth(1)
+    // args() は Unicode として正しくない引数があるとパニックする（起動直後に落ちる）。
+    // Windows のファイル名には稀にそういう文字が含まれるので、壊さずに受け取る。
+    std::env::args_os()
+        .nth(1)
+        .map(|a| a.to_string_lossy().into_owned())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

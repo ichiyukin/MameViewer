@@ -1664,8 +1664,9 @@ function handleTextLinkClick(e: MouseEvent) {
   e.preventDefault();
   e.stopPropagation(); // 画面全体の click（ページ送り）へ届かせない
   const href = a.getAttribute("href") ?? "";
-  // 組み立て時に http/https だけを通しているが、念のためここでも確かめる。
-  if (/^https?:\/\//i.test(href)) {
+  // 本文は組み立て時に http/https だけを通しているが、念のためここでも確かめる。
+  // mailto は「このアプリについて」の連絡先用（既定のメールソフトで開く）。
+  if (/^(https?:\/\/|mailto:)/i.test(href)) {
     openUrl(href).catch((err) => console.error("リンクを開けませんでした:", err));
   }
 }
@@ -2972,7 +2973,17 @@ async function pickFile() {
 
 async function pickFolder() {
   const selected = await openDialog({ directory: true, multiple: false });
-  if (typeof selected === "string") openImageOrFolder(selected);
+  if (typeof selected !== "string") return;
+  // openPath と同じく「開いている最中」の表示と最終閲覧の記録を行う。
+  // ただしフォルダは拡張子で振り分けない（「Vol.1」「資料.pdf」という名前の
+  // フォルダもあり得るため、openPath に渡すと別の開き方に回ってしまう）。
+  const seq = beginOpenRequest();
+  beginOpening(selected, seq);
+  try {
+    await openImageOrFolder(selected, false, seq);
+  } finally {
+    endOpening(seq);
+  }
 }
 
 // ---- 下部バー表示制御 ----
@@ -3149,6 +3160,9 @@ document.querySelector("#keybind-close")?.addEventListener("click", closeKeybind
 // ---- このアプリについてパネル ----
 let aboutOpen = false;
 const aboutEl = document.querySelector<HTMLDivElement>("#about")!;
+// 連絡先・寄付のリンク。既定の動作だとアプリ内に枠だけのブラウザ窓が開き、
+// 普段のブラウザのログイン（GitHub等）が使えないため、既定のブラウザで開く。
+aboutEl.addEventListener("click", handleTextLinkClick);
 
 // 実際に動いているアプリのバージョン（tauri.conf.json の version）を表示する。
 getVersion()
