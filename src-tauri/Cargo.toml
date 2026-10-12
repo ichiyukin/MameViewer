@@ -37,4 +37,5 @@ sevenz-rust = "0.6"
 walkdir = "2"
 base64 = "0.22"
 fast_image_resize = "5"
+tauri-plugin-single-instance = "2"
 

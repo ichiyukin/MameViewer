@@ -98,6 +98,10 @@ struct HistoryData {
     /// 巻末に達した時の挙動："loop"（同じ巻の先頭へ）または "next"（次の巻へ）。
     #[serde(rename = "endBehavior", default = "default_end_behavior")]
     end_behavior: String,
+    /// true＝ファイルを開くと今の窓で開く（2回目の起動は今の窓へ渡して終わる）。
+    /// false＝これまでどおり新しい窓で開く。起動時に読むので、切り替えは次の起動から。
+    #[serde(rename = "singleWindow", default)]
+    single_window: bool,
 }
 
 fn default_end_behavior() -> String {
@@ -152,6 +156,50 @@ fn write_json_atomic<T: serde::Serialize + ?Sized>(path: &Path, value: &T) {
     }
 }
 
+/// 保存ファイルを読む。読めない・壊れている場合は None（空として扱わない。
+/// 空として扱うと、その空で手元の内容を上書きしてしまう）。
+fn read_store<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+}
+
+/// 他の窓が保存した最新の内容を、手元の控えへ取り込む（一覧を出す前などに呼ぶ）。
+fn refresh_store<T: serde::de::DeserializeOwned>(data: &Mutex<T>, write: &Mutex<()>, path: &Path) {
+    let _w = write.lock().unwrap(); // 保存の途中に割り込んで古い内容へ戻さない
+    if let Some(fresh) = read_store::<T>(path) {
+        *data.lock().unwrap() = fresh;
+    }
+}
+
+/// 保存ファイルを読み直してから変更し、書き出す。
+/// 窓を複数開いていると、それぞれが自分の控えを持っている。控えのまま保存すると、
+/// 別の窓が先に保存した内容（付けたしおり・読書位置など）を上書きして消してしまう。
+/// 書き込み権を取ったまま「読み直し→変更→書き出し」を一続きで行う
+/// （途中で手放すと、同じ窓の中の別の保存とも食い違う）。
+fn update_store<T, R>(
+    data: &Mutex<T>,
+    write: &Mutex<()>,
+    path: &Path,
+    f: impl FnOnce(&mut T) -> R,
+) -> R
+where
+    T: Clone + serde::Serialize + serde::de::DeserializeOwned,
+{
+    let _w = write.lock().unwrap();
+    let fresh = read_store::<T>(path);
+    let (result, snapshot) = {
+        let mut guard = data.lock().unwrap();
+        if let Some(v) = fresh {
+            *guard = v;
+        }
+        let result = f(&mut guard);
+        (result, guard.clone())
+    };
+    write_json_atomic(path, &snapshot);
+    result
+}
+
 // 保存の順序を守るための書き込み権（種類ごと）。
 // 「控えを取る→書く」の間に別の保存が割り込むと、古い控えが後から書かれて
 // 新しい内容がディスクから消える。書き込み権を取ってから控えを取れば、
@@ -171,10 +219,9 @@ fn load_history_from_disk() -> HistoryData {
         .unwrap_or_default()
 }
 
-fn persist_history() {
-    let _w = HISTORY_WRITE.lock().unwrap();
-    let snap = HISTORY.lock().unwrap().clone();
-    write_json_atomic(&history_path(), &snap);
+/// history を読み直してから変更して保存する（update_store 参照）。
+fn update_history<R>(f: impl FnOnce(&mut HistoryData) -> R) -> R {
+    update_store(&HISTORY, &HISTORY_WRITE, &history_path(), f)
 }
 
 static HISTORY: LazyLock<Mutex<HistoryData>> = LazyLock::new(|| Mutex::new(load_history_from_disk()));
@@ -182,6 +229,8 @@ static HISTORY: LazyLock<Mutex<HistoryData>> = LazyLock::new(|| Mutex::new(load_
 /// 起動時などにフロントが履歴全体を取得する。
 #[tauri::command]
 fn get_history() -> HistoryData {
+    // 別の窓で読んだ位置も反映する（窓を複数開いている場合）。
+    refresh_store(&HISTORY, &HISTORY_WRITE, &history_path());
     HISTORY.lock().unwrap().clone()
 }
 
@@ -193,23 +242,28 @@ fn get_history() -> HistoryData {
 #[tauri::command]
 async fn save_position(anchor: String, page: usize) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        {
-            let mut h = HISTORY.lock().unwrap();
+        update_history(|h| {
             h.positions.insert(anchor.clone(), page);
             h.last_opened = Some(anchor);
-        }
-        persist_history();
+        });
     })
     .await
     .map_err(|e| e.to_string())
+}
+
+/// ファイルを開く時に今の窓を使うか（true）、新しい窓を開くか（false）を設定する。
+#[tauri::command]
+async fn set_single_window(enabled: bool) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || update_history(|h| h.single_window = enabled))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// 巻末に達した時の挙動（ループ／次の巻へ）を設定する。
 #[tauri::command]
 async fn set_end_behavior(mode: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        HISTORY.lock().unwrap().end_behavior = mode;
-        persist_history();
+        update_history(|h| h.end_behavior = mode);
     })
     .await
     .map_err(|e| e.to_string())
@@ -252,10 +306,9 @@ fn load_settings_from_disk() -> ResizeSettings {
         .unwrap_or_default()
 }
 
-fn persist_settings() {
-    let _w = SETTINGS_WRITE.lock().unwrap();
-    let snap = SETTINGS.lock().unwrap().clone();
-    write_json_atomic(&settings_path(), &snap);
+/// settings を読み直してから変更して保存する（update_store 参照）。
+fn update_settings<R>(f: impl FnOnce(&mut ResizeSettings) -> R) -> R {
+    update_store(&SETTINGS, &SETTINGS_WRITE, &settings_path(), f)
 }
 
 static SETTINGS: LazyLock<Mutex<ResizeSettings>> =
@@ -269,8 +322,7 @@ fn get_settings() -> ResizeSettings {
 #[tauri::command]
 async fn set_settings(settings: ResizeSettings) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        *SETTINGS.lock().unwrap() = settings;
-        persist_settings();
+        update_settings(|s| *s = settings);
         RESIZED_CACHE.lock().unwrap().clear(); // フィルター変更後は再生成させる
     })
     .await
@@ -466,10 +518,9 @@ fn load_bookmarks_from_disk() -> Vec<Bookmark> {
         .unwrap_or_default()
 }
 
-fn persist_bookmarks() {
-    let _w = BOOKMARKS_WRITE.lock().unwrap();
-    let snap = BOOKMARKS.lock().unwrap().clone();
-    write_json_atomic(&bookmarks_path(), &snap);
+/// bookmarks を読み直してから変更して保存する（update_store 参照）。
+fn update_bookmarks<R>(f: impl FnOnce(&mut Vec<Bookmark>) -> R) -> R {
+    update_store(&BOOKMARKS, &BOOKMARKS_WRITE, &bookmarks_path(), f)
 }
 
 static BOOKMARKS: LazyLock<Mutex<Vec<Bookmark>>> =
@@ -509,21 +560,13 @@ fn try_relink_bookmarks(new_path: &str) {
     if missing.is_empty() {
         return;
     }
-    // 保存もロックの外で行う（書き込みの間だけでも他を待たせないため）。
-    let changed = {
-        let mut list = BOOKMARKS.lock().unwrap();
-        let mut changed = false;
+    update_bookmarks(|list| {
         for b in list.iter_mut() {
             if missing.iter().any(|a| a == &b.anchor) {
                 b.anchor = new_path.to_string();
-                changed = true;
             }
         }
-        changed
-    };
-    if changed {
-        persist_bookmarks();
-    }
+    });
 }
 
 fn add_bookmark_sync(anchor: String, page: usize) -> Result<BookmarkView, String> {
@@ -539,8 +582,8 @@ fn add_bookmark_sync(anchor: String, page: usize) -> Result<BookmarkView, String
         .map(|m| m.len())
         .unwrap_or(0);
 
-    let bm = {
-        let mut list = BOOKMARKS.lock().unwrap();
+    // 番号は読み直した最新の一覧から振る（別の窓が付けたしおりと重ならないように）。
+    let bm = update_bookmarks(|list| {
         let id = list.iter().map(|b| b.id).max().unwrap_or(0) + 1;
         let bm = Bookmark {
             id,
@@ -552,8 +595,7 @@ fn add_bookmark_sync(anchor: String, page: usize) -> Result<BookmarkView, String
         };
         list.push(bm.clone());
         bm
-    };
-    persist_bookmarks();
+    });
     Ok(BookmarkView {
         id: bm.id,
         anchor: bm.anchor,
@@ -574,8 +616,7 @@ async fn add_bookmark(anchor: String, page: usize) -> Result<BookmarkView, Strin
 
 /// 指定したしおりを削除する。
 fn remove_bookmark_sync(id: u64) {
-    BOOKMARKS.lock().unwrap().retain(|b| b.id != id);
-    persist_bookmarks();
+    update_bookmarks(|list| list.retain(|b| b.id != id));
 }
 
 #[tauri::command]
@@ -590,6 +631,7 @@ async fn remove_bookmark(id: u64) -> Result<(), String> {
 /// 存在確認（exists）は切断されたネットワークドライブで長く待たされる。
 /// ロックの外で行い、しおりの登録・削除を一緒に止めないようにする。
 fn list_bookmarks_sync(anchor: Option<String>) -> Vec<BookmarkView> {
+    refresh_store(&BOOKMARKS, &BOOKMARKS_WRITE, &bookmarks_path()); // 別の窓で付けた分も出す
     let picked: Vec<Bookmark> = {
         let list = BOOKMARKS.lock().unwrap();
         list.iter()
@@ -668,10 +710,9 @@ fn load_shelf_from_disk() -> Vec<ShelfItem> {
         .unwrap_or_default()
 }
 
-fn persist_shelf() {
-    let _w = SHELF_WRITE.lock().unwrap();
-    let snap = SHELF.lock().unwrap().clone();
-    write_json_atomic(&shelf_path(), &snap);
+/// shelf を読み直してから変更して保存する（update_store 参照）。
+fn update_shelf<R>(f: impl FnOnce(&mut Vec<ShelfItem>) -> R) -> R {
+    update_store(&SHELF, &SHELF_WRITE, &shelf_path(), f)
 }
 
 static SHELF: LazyLock<Mutex<Vec<ShelfItem>>> = LazyLock::new(|| Mutex::new(load_shelf_from_disk()));
@@ -700,10 +741,9 @@ fn load_favorites_from_disk() -> Vec<FavoritePlace> {
         .unwrap_or_default()
 }
 
-fn persist_favorites() {
-    let _w = FAVORITES_WRITE.lock().unwrap();
-    let snap = FAVORITES.lock().unwrap().clone();
-    write_json_atomic(&favorites_path(), &snap);
+/// favorites を読み直してから変更して保存する（update_store 参照）。
+fn update_favorites<R>(f: impl FnOnce(&mut Vec<FavoritePlace>) -> R) -> R {
+    update_store(&FAVORITES, &FAVORITES_WRITE, &favorites_path(), f)
 }
 
 static FAVORITES: LazyLock<Mutex<Vec<FavoritePlace>>> =
@@ -715,6 +755,7 @@ static FAVORITES: LazyLock<Mutex<Vec<FavoritePlace>>> =
 /// 開けるかどうかは、実際に開こうとした時点で分かればよい。
 #[tauri::command]
 fn list_favorites() -> Vec<FavoritePlace> {
+    refresh_store(&FAVORITES, &FAVORITES_WRITE, &favorites_path()); // 別の窓で登録した分も出す
     let mut list = FAVORITES.lock().unwrap().clone();
     list.sort_by(|a, b| b.added_at.cmp(&a.added_at));
     list
@@ -729,18 +770,15 @@ async fn add_favorite(path: String) -> Result<(), String> {
             .map(|n| n.to_string_lossy().to_string())
             // ドライブ直下やネットワーク共有の直下はファイル名が取れないのでパスを名前にする。
             .unwrap_or_else(|| path.clone());
-        {
-            let mut list = FAVORITES.lock().unwrap();
-            if list.iter().any(|f| f.path == path) {
-                return;
+        update_favorites(|list| {
+            if !list.iter().any(|f| f.path == path) {
+                list.push(FavoritePlace {
+                    path,
+                    name,
+                    added_at: now_epoch_secs(),
+                });
             }
-            list.push(FavoritePlace {
-                path,
-                name,
-                added_at: now_epoch_secs(),
-            });
-        }
-        persist_favorites();
+        });
     })
     .await
     .map_err(|e| e.to_string())
@@ -750,8 +788,7 @@ async fn add_favorite(path: String) -> Result<(), String> {
 #[tauri::command]
 async fn remove_favorite(path: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        FAVORITES.lock().unwrap().retain(|f| f.path != path);
-        persist_favorites();
+        update_favorites(|list| list.retain(|f| f.path != path));
     })
     .await
     .map_err(|e| e.to_string())
@@ -772,8 +809,7 @@ async fn add_to_shelf(anchor: String, page: usize) -> Result<(), String> {
             .map(|t| base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &*t))
             .unwrap_or_default(); // 絵が作れなくても登録は成立させる
         let file_name = anchor_display_name(&anchor);
-        {
-            let mut list = SHELF.lock().unwrap();
+        update_shelf(|list| {
             if let Some(existing) = list.iter_mut().find(|s| s.anchor == anchor) {
                 existing.thumb_base64 = thumb_base64;
             } else {
@@ -784,8 +820,7 @@ async fn add_to_shelf(anchor: String, page: usize) -> Result<(), String> {
                     added_at: now_epoch_secs(),
                 });
             }
-        }
-        persist_shelf();
+        });
         Ok(())
     })
     .await
@@ -876,8 +911,7 @@ async fn add_path_to_shelf(path: String) -> Result<(), String> {
             base64::Engine::encode(&base64::engine::general_purpose::STANDARD, out.get_ref());
 
         let file_name = anchor_display_name(&anchor);
-        {
-            let mut list = SHELF.lock().unwrap();
+        update_shelf(|list| {
             if let Some(existing) = list.iter_mut().find(|s| s.anchor == anchor) {
                 existing.thumb_base64 = thumb_base64;
             } else {
@@ -888,8 +922,7 @@ async fn add_path_to_shelf(path: String) -> Result<(), String> {
                     added_at: now_epoch_secs(),
                 });
             }
-        }
-        persist_shelf();
+        });
         Ok(())
     })
     .await
@@ -899,8 +932,7 @@ async fn add_path_to_shelf(path: String) -> Result<(), String> {
 #[tauri::command]
 async fn remove_from_shelf(anchor: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        SHELF.lock().unwrap().retain(|s| s.anchor != anchor);
-        persist_shelf();
+        update_shelf(|list| list.retain(|s| s.anchor != anchor));
     })
     .await
     .map_err(|e| e.to_string())
@@ -910,6 +942,7 @@ async fn remove_from_shelf(anchor: String) -> Result<(), String> {
 #[tauri::command]
 async fn list_shelf() -> Result<Vec<ShelfItemView>, String> {
     tauri::async_runtime::spawn_blocking(|| {
+        refresh_store(&SHELF, &SHELF_WRITE, &shelf_path()); // 別の窓で追加した分も出す
         let mut items: Vec<ShelfItem> = SHELF.lock().unwrap().clone();
         items.sort_by(|a, b| b.added_at.cmp(&a.added_at));
         items
@@ -2841,7 +2874,24 @@ fn get_launch_path() -> Option<String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     sweep_stale_temp_dirs(); // 前回の異常終了で残った一時フォルダを片付ける
-    tauri::Builder::default()
+    let mut builder = tauri::Builder::default();
+    // 「今の窓で開く」設定なら、2回目以降の起動はファイルを今の窓へ渡して終わる。
+    // 設定は起動時に読む（後から開かれた側も同じファイルを読むので判断が揃う）。
+    // 他のプラグインより先に登録する必要がある（プラグインの決まり）。
+    if HISTORY.lock().unwrap().single_window {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            use tauri::{Emitter, Manager};
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+            // 1つ目はアプリ自身のパス。ファイル無しで起動された時は前に出すだけ。
+            if let Some(path) = argv.get(1) {
+                let _ = app.emit("open-path", path.clone());
+            }
+        }));
+    }
+    builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         // 終了時のウィンドウサイズ・位置・最大化状態を保存し、次回起動時に復元する
@@ -2878,6 +2928,7 @@ pub fn run() {
             list_places,
             dir_exists,
             path_exists,
+            set_single_window,
             folder_shape,
             get_file_size,
             get_read_progress,
@@ -3015,6 +3066,32 @@ mod tests {
         assert!(history_path().starts_with(&dir));
     }
 
+    /// 窓を複数開いた時：別の窓が保存した内容を、こちらの保存で消さないこと。
+    #[test]
+    fn update_rereads_before_writing() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        // こちらの窓は位置Aだけを知っている。
+        update_history(|h| {
+            h.positions.clear();
+            h.positions.insert("A".into(), 1);
+        });
+        // 別の窓が、こちらの控えを通さずに位置Bを書き足した（ディスクだけが新しい）。
+        let mut other: HistoryData = read_store(&history_path()).expect("保存済み");
+        other.positions.insert("B".into(), 2);
+        write_json_atomic(&history_path(), &other);
+        // こちらで位置Cを保存しても、Bが残ること。
+        update_history(|h| {
+            h.positions.insert("C".into(), 3);
+        });
+        let disk: HistoryData = read_store(&history_path()).expect("保存済み");
+        assert_eq!(disk.positions.get("A"), Some(&1));
+        assert_eq!(disk.positions.get("B"), Some(&2), "別の窓の記録が残る");
+        assert_eq!(disk.positions.get("C"), Some(&3));
+        // 一覧などで読み直した時も、別の窓の分が見えること。
+        refresh_store(&HISTORY, &HISTORY_WRITE, &history_path());
+        assert_eq!(HISTORY.lock().unwrap().positions.get("B"), Some(&2));
+    }
+
     /// 保存：一時ファイル経由で置き換え、途中のファイルを残さないこと。
     #[test]
     fn json_is_written_atomically() {
@@ -3121,12 +3198,12 @@ mod tests {
         std::fs::copy(zip, &moved).unwrap();
         // 元ファイルが「存在しない」状況を作れないため（testディレクトリの資産のため）、
         // 一時的にブックマークのanchorだけ「存在しない旧パス」に差し替えて再現する。
-        {
-            let mut list = BOOKMARKS.lock().unwrap();
+        // 保存ファイルも書き換える（一覧を出す前に読み直すため、メモリだけでは戻される）。
+        update_bookmarks(|list| {
             for b in list.iter_mut() {
                 b.anchor = "C:\\存在しない\\旧パス\\test.zip".to_string();
             }
-        }
+        });
         assert!(!list_bookmarks_sync(None)[0].exists, "旧パスは存在しないこと");
         try_relink_bookmarks(moved.to_str().unwrap());
         // ファイル名が違う（test.zip → mviewer_test_moved.zip）ため再リンクされないことを確認。

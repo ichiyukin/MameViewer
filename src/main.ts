@@ -4,6 +4,7 @@ import { open as openDialog, ask } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { listen } from "@tauri-apps/api/event";
 
 const ARCHIVE_EXTS = ["zip", "cbz", "rar", "cbr", "7z", "cb7"];
 const IMAGE_EXTS = ["jpg", "jpeg", "png", "webp", "gif", "avif", "bmp"];
@@ -3345,10 +3346,14 @@ function toggleSpread() {
 // 巻末に達した時の挙動（ループ／次の巻へ）を設定・保存する。
 function setEndBehavior(mode: "loop" | "next") {
   endBehavior = mode;
-  for (const b of menu.querySelectorAll<HTMLButtonElement>("[data-end]")) {
-    b.classList.toggle("active", b.dataset.end === mode);
-  }
+  updateEndBehaviorUi();
   invoke("set_end_behavior", { mode }).catch(() => {});
+}
+
+function updateEndBehaviorUi() {
+  for (const b of menu.querySelectorAll<HTMLButtonElement>("[data-end]")) {
+    b.classList.toggle("active", b.dataset.end === endBehavior);
+  }
 }
 
 // 初期状態のハイライトを反映（前回終了時の設定を復元）
@@ -4274,6 +4279,19 @@ function basenameOf(path: string): string {
 
 async function initHistoryAndResume() {
   try {
+    // 設定（巻末の動作・窓の開き方）は、どの起動の仕方でも先に戻す。
+    // 以前はファイルのダブルクリックで起動すると下の分岐で先に抜けてしまい、
+    // 「次の巻へ進む」を選んでいても巻末で先頭に戻っていた。
+    const h = await invoke<{
+      lastOpened: string | null;
+      positions: Record<string, number>;
+      endBehavior: "loop" | "next";
+      singleWindow: boolean;
+    }>("get_history");
+    endBehavior = h.endBehavior ?? "loop";
+    updateEndBehaviorUi();
+    applyWindowModeUi(h.singleWindow ? "single" : "multi");
+
     // ファイル関連付け（拡張子ダブルクリック）から起動された場合は、そのファイルを
     // 最優先で開く（再開ダイアログより明示的な意図を優先する）。
     const launchPath = await invoke<string | null>("get_launch_path");
@@ -4282,12 +4300,6 @@ async function initHistoryAndResume() {
       return;
     }
 
-    const h = await invoke<{
-      lastOpened: string | null;
-      positions: Record<string, number>;
-      endBehavior: "loop" | "next";
-    }>("get_history");
-    setEndBehavior(h.endBehavior ?? "loop");
     const lastOpened = h.lastOpened;
 
     // もう無いファイルを勧めない（消した・外付けを外した本で「続きから」を
@@ -4324,6 +4336,29 @@ async function initHistoryAndResume() {
     console.error("履歴の読み込みに失敗:", e);
   }
 }
+
+// ---- ファイルを開く時の窓（設定メニュー） ----
+// 「今の窓で開く」を選ぶと、2回目以降の起動はファイルをこの窓へ渡して終わる。
+// 起動時に決まる仕組みなので、切り替えは次の起動から効く。
+const windowModeRadios = document.querySelectorAll<HTMLInputElement>('input[name="window-mode"]');
+
+function applyWindowModeUi(mode: "single" | "multi") {
+  for (const r of windowModeRadios) r.checked = r.value === mode;
+}
+
+for (const r of windowModeRadios) {
+  r.addEventListener("change", () => {
+    if (!r.checked) return;
+    invoke("set_single_window", { enabled: r.value === "single" }).catch((e) =>
+      console.error("窓の設定を保存できませんでした:", e)
+    );
+  });
+}
+
+// 「今の窓で開く」の時、別に起動されたファイルがこちらへ渡ってくる。
+listen<string>("open-path", (e) => {
+  if (e.payload) openPath(e.payload);
+}).catch((e) => console.error("ファイルの受け取りを準備できませんでした:", e));
 
 initHistoryAndResume();
 
