@@ -329,7 +329,7 @@ static RESIZED_CACHE: LazyLock<Mutex<HashMap<(usize, u32, u32), Arc<Vec<u8>>>>> 
 /// ページを実際にデコード・指定サイズへリサイズしてJPEGへエンコードする（重い処理）。
 fn render_page_resized(index: usize, width: u32, height: u32) -> Result<Vec<u8>, String> {
     let raw = read_page_bytes(index)?;
-    let img = image::load_from_memory(&raw[..]).map_err(|e| format!("画像デコード失敗: {e}"))?;
+    let img = decode_oriented(&raw[..]).map_err(|e| format!("画像デコード失敗: {e}"))?;
     let (nw, nh) = (img.width(), img.height());
     let settings = SETTINGS.lock().unwrap().clone();
     let filter = resolve_filter(&settings, nw, nh, width.max(1), height.max(1));
@@ -369,6 +369,31 @@ async fn get_page_resized(index: usize, width: u32, height: u32) -> Result<tauri
     .map_err(|e| e.to_string())?
 }
 
+/// 向きの指定（EXIF）が縦横を入れ替えるものか。
+fn orientation_swaps_axes(o: image::metadata::Orientation) -> bool {
+    use image::metadata::Orientation::*;
+    matches!(o, Rotate90 | Rotate270 | Rotate90FlipH | Rotate270FlipH)
+}
+
+/// 画像を復号し、EXIF の向きを反映した状態で返す。
+/// スマホやスキャナの写真は、横倒しのまま保存して「向き」だけを添えていることが多い。
+/// 画面の <img> はその向きどおりに表示するので、サムネイル等も揃えないと
+/// 一覧・ミニマップ・しおりの絵だけ横倒しになる。
+fn decode_oriented(raw: &[u8]) -> Result<image::DynamicImage, String> {
+    use image::ImageDecoder;
+    let mut decoder = image::ImageReader::new(Cursor::new(raw))
+        .with_guessed_format()
+        .map_err(|e| e.to_string())?
+        .into_decoder()
+        .map_err(|e| e.to_string())?;
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut img = image::DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())?;
+    img.apply_orientation(orientation);
+    Ok(img)
+}
+
 /// ページの実寸だけを軽量に返す（ヘッダーのみ読み、フルデコードしない）。
 #[tauri::command]
 /// 幅・高さに加え、GIF（アニメーションの可能性がある形式）かどうかを返す。
@@ -376,13 +401,24 @@ async fn get_page_resized(index: usize, width: u32, height: u32) -> Result<tauri
 /// リサイズをスキップして原寸のまま表示する（ブラウザの標準再生に任せる）。
 async fn get_page_dims(index: usize) -> Result<(u32, u32, bool), String> {
     tauri::async_runtime::spawn_blocking(move || {
+        use image::ImageDecoder;
         let raw = read_page_bytes(index)?;
         let reader = image::ImageReader::new(Cursor::new(&raw[..]))
             .with_guessed_format()
             .map_err(|e| e.to_string())?;
         let is_gif = matches!(reader.format(), Some(image::ImageFormat::Gif));
-        let (w, h) = reader.into_dimensions().map_err(|e| e.to_string())?;
-        Ok((w, h, is_gif))
+        let mut decoder = reader.into_decoder().map_err(|e| e.to_string())?;
+        let (w, h) = decoder.dimensions();
+        // 画面の <img> は EXIF の向きを反映して表示する。生の寸法を返すと、
+        // 縦向きに見える写真を横長と判定してしまい、見開きの判定と枠がずれる。
+        let orientation = decoder
+            .orientation()
+            .unwrap_or(image::metadata::Orientation::NoTransforms);
+        Ok(if orientation_swaps_axes(orientation) {
+            (h, w, is_gif)
+        } else {
+            (w, h, is_gif)
+        })
     })
     .await
     .map_err(|e| e.to_string())?
@@ -825,7 +861,7 @@ async fn add_path_to_shelf(path: String) -> Result<(), String> {
             (path.clone(), raw)
         };
 
-        let img = image::load_from_memory(&raw).map_err(|e| format!("画像デコード失敗: {e}"))?;
+        let img = decode_oriented(&raw).map_err(|e| format!("画像デコード失敗: {e}"))?;
         let rgb = img.thumbnail(THUMB_MAX, THUMB_MAX).to_rgb8();
         let mut out = Cursor::new(Vec::new());
         image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 80)
@@ -1350,7 +1386,10 @@ async fn list_tree_dir(path: String) -> Result<Vec<TreeEntry>, String> {
         let mut dirs = Vec::new();
         let mut files = Vec::new();
         for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
-            let entry = entry.map_err(|e| e.to_string())?;
+            // 読めない項目が1つあるだけで一覧全体を失敗にしない。失敗にすると、
+            // そのフォルダの中身がまるごと空に見えてしまう（権限の無い項目・
+            // 壊れたリンク等はネットワーク共有や古いドライブでよくある）。
+            let Ok(entry) = entry else { continue };
             let p = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
             let is_dir = p.is_dir();
@@ -1415,7 +1454,7 @@ fn folder_shape_of(dir: &Path) -> Result<FolderShape, String> {
     let mut has_subfolders = false;
     let mut has_direct_images = false;
     for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
+        let Ok(entry) = entry else { continue }; // 読めない項目は飛ばす（全体を失敗にしない）
         let p = entry.path();
         if p.is_dir() {
             has_subfolders = true;
@@ -1450,7 +1489,7 @@ fn list_folder(dir: &Path, recursive: bool) -> Result<Vec<String>, String> {
         }
     } else {
         for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
-            let entry = entry.map_err(|e| e.to_string())?;
+            let Ok(entry) = entry else { continue }; // 読めない項目は飛ばす（全体を失敗にしない）
             let p = entry.path();
             if p.is_file() {
                 let s = p.to_string_lossy().to_string();
@@ -1482,7 +1521,7 @@ fn list_volumes_sync(anchor: &str) -> Result<Vec<String>, String> {
         .ok_or_else(|| "親フォルダが見つかりません".to_string())?;
     let mut volumes = Vec::new();
     for entry in std::fs::read_dir(parent).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
+        let Ok(entry) = entry else { continue }; // 読めない項目は飛ばす（巻移動を止めない）
         let ep = entry.path();
         let s = ep.to_string_lossy().to_string();
         // PDF・テキストも「巻」として扱う。含めないと、同じフォルダに
@@ -1955,7 +1994,7 @@ fn store_thumb_from_bytes(gen: u64, index: usize, raw: &[u8]) {
     if THUMBS.lock().unwrap().contains_key(&index) {
         return;
     }
-    let Ok(img) = image::load_from_memory(raw) else {
+    let Ok(img) = decode_oriented(raw) else {
         return;
     };
     let thumb = img.thumbnail(THUMB_MAX, THUMB_MAX);
@@ -2760,7 +2799,7 @@ fn make_thumbnail(index: usize) -> Result<Arc<Vec<u8>>, String> {
     // いた場合（挿入直前に世代不一致）はキャッシュへ書き込まない。
     let gen = THUMB_GEN.load(AtomicOrd::Relaxed);
     let raw = read_page_bytes(index)?;
-    let img = image::load_from_memory(&raw[..]).map_err(|e| format!("画像デコード失敗: {e}"))?;
+    let img = decode_oriented(&raw[..]).map_err(|e| format!("画像デコード失敗: {e}"))?;
     let thumb = img.thumbnail(THUMB_MAX, THUMB_MAX);
     let rgb = thumb.to_rgb8();
     let mut out = Cursor::new(Vec::new());
@@ -2925,6 +2964,37 @@ mod tests {
         assert!(matches!(detect_format("b.CBR"), Ok(Format::Rar)));
         assert!(matches!(detect_format("c.7z"), Ok(Format::SevenZ)));
         assert!(detect_format("d.txt").is_err());
+    }
+
+    /// EXIF の向き：横倒しで保存され「90度回して表示」と添えられた写真を、
+    /// 画面（<img>）と同じく向きを反映した縦横で扱うこと。
+    #[test]
+    fn exif_orientation_is_applied() {
+        use image::GenericImageView;
+        // 横4×縦2のJPEGを作り、SOIの直後に「向き=6（90度回転）」のEXIFを差し込む。
+        let src = image::RgbImage::from_pixel(4, 2, image::Rgb([200, 100, 50]));
+        let mut jpg = Cursor::new(Vec::new());
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpg, 90)
+            .encode(src.as_raw(), 4, 2, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        let jpg = jpg.into_inner();
+        let exif: [u8; 36] = [
+            0xFF, 0xE1, 0x00, 0x22, // APP1, 長さ34
+            b'E', b'x', b'i', b'f', 0, 0, // Exif識別子
+            b'I', b'I', 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00, // TIFFヘッダ（リトルエンディアン）
+            0x01, 0x00, // 項目数1
+            0x12, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, // 向き=6
+            0x00, 0x00, 0x00, 0x00, // 次のIFDなし
+        ];
+        let mut with_exif = jpg[..2].to_vec(); // SOI
+        with_exif.extend_from_slice(&exif);
+        with_exif.extend_from_slice(&jpg[2..]);
+
+        // 生のままなら 4×2。向きを反映すると 2×4（縦長）になること。
+        assert_eq!(image::load_from_memory(&with_exif).unwrap().dimensions(), (4, 2));
+        assert_eq!(decode_oriented(&with_exif).unwrap().dimensions(), (2, 4));
+        // 向きの無い画像はそのまま。
+        assert_eq!(decode_oriented(&jpg).unwrap().dimensions(), (4, 2));
     }
 
     /// 保存先：テストでは実際の保存先（%APPDATA%\MameViewer）を使わないこと。

@@ -740,7 +740,8 @@ function runPrefetch() {
   if (spreadMode) {
     // 見開きは表示前にページ寸法（横長かどうかの判定）が必要で、
     // これを待つ分だけめくりが遅れる。次の組の分を先に取っておく。
-    for (const t of [current + 2, current + 3]) {
+    // 戻る時に前の組を決めるのにも寸法が要るので、手前の2枚も取っておく。
+    for (const t of [current + 2, current + 3, current - 1, current - 2]) {
       if (t >= 0 && t < pageCount) getImageDims(t).catch(() => {});
     }
   }
@@ -1566,6 +1567,9 @@ function buildTextView() {
   textviewBody.style.setProperty("--text-size", `${textFontRem}rem`); // 前回の文字サイズを反映
   // 画像側の表示要素は隠し、本文だけを見せる。
   img.classList.remove("loaded");
+  // 隠すだけだと、最後に見ていたページの絵がデコード済みのまま残り続ける
+  // （URLを解放しても要素が指している限り実体は消えない）。本文の間は手放す。
+  img.removeAttribute("src");
   spread.classList.add("hidden");
   textview.classList.remove("hidden");
   textviewBody.innerHTML = textIsMarkdown
@@ -1807,23 +1811,55 @@ function turnPage(dir: 1 | -1) {
     go(dir);
     return;
   }
-  const step = shownCount || 1;
-  let next = current + dir * step;
-  // 見開き(1,2)から2ページ戻ると -1 になるが、表紙(0)をまだ見ていないので
-  // 前の巻へ遡らず表紙に着地させる（表紙飛ばし防止）。
-  if (dir < 0 && next < 0 && current > 0) next = 0;
-  if (next >= pageCount) {
-    handleEndReached(dir);
+  if (dir < 0) {
+    turnSpreadBack();
     return;
   }
-  if (next < 0) {
-    handleStartReached();
+  const step = shownCount || 1;
+  const next = current + step;
+  if (next >= pageCount) {
+    handleEndReached(dir);
     return;
   }
   if (next === current) return;
   current = next;
   schedulePositionSave();
   render();
+}
+
+// 見開きで戻る。戻り幅は「今見ている組の枚数」ではなく「1つ前の組の枚数」で決める。
+// 今の枚数で戻ると、例えば 表紙(0)→横長(1)→2-3 の並びで 2-3 から2つ戻った時に
+// 表紙へ着地し、横長の1ページが飛ばされてしまう。
+function turnSpreadBack() {
+  if (current <= 0) {
+    handleStartReached();
+    return;
+  }
+  const from = current;
+  const gen = archiveGen;
+  prevSpreadStart(from).then((next) => {
+    // 寸法を待つ間に別の操作でページが動いていたら、その結果を優先する。
+    if (gen !== archiveGen || current !== from || next === current) return;
+    current = next;
+    schedulePositionSave();
+    render();
+  });
+}
+
+/// 1つ前の組の先頭ページ。前の組は from-1 で終わる。
+/// 表紙(0)・横長・GIFアニメは単独で出すので、その場合は from-1 だけの組になる。
+async function prevSpreadStart(from: number): Promise<number> {
+  const end = from - 1;
+  if (end <= 0) return 0; // 表紙は単独
+  const start = end - 1;
+  if (start < 1) return end; // 表紙と組にはしない
+  try {
+    const [a, b] = await Promise.all([getImageDims(start), getImageDims(end)]);
+    const single = (d: { w: number; h: number; animated: boolean }) => d.w > d.h || d.animated;
+    return single(a) || single(b) ? end : start;
+  } catch {
+    return start; // 寸法が分からなければ従来どおり2枚戻る
+  }
 }
 
 function jump(index: number) {
