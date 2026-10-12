@@ -3,7 +3,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import { open as openDialog, ask } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { listen } from "@tauri-apps/api/event";
 
 const ARCHIVE_EXTS = ["zip", "cbz", "rar", "cbr", "7z", "cb7"];
@@ -2439,6 +2439,18 @@ const TREE_MENU_ITEMS: TreeMenuItem[] = [
         updateShelfAddBtnUi();
       } catch (e) {
         alert("本棚に追加できませんでした: " + e);
+      }
+    },
+  },
+  {
+    // エクスプローラーでその項目の入っているフォルダを開き、項目を選んだ状態にする
+    // （Windows の「ファイルの場所を開く」と同じ動き）。フォルダも対象にする。
+    label: () => "ファイルの場所を開く",
+    run: async (entry) => {
+      try {
+        await revealItemInDir(entry.path);
+      } catch (e) {
+        alert("ファイルの場所を開けませんでした: " + e);
       }
     },
   },
