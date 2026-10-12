@@ -1,0 +1,7 @@
+# C/C++ の実行時ライブラリを exe に埋め込む（静的リンク）。
+# Rar の読み込み（unrar クレート）は C++ で書かれており、既定では
+# MSVCP140.dll（Visual C++ 再頒布可能パッケージ）に依存する。
+# これが入っていないPCでは「MSVCP140.dll が見つからない」で起動できないため、
+# 依存そのものを無くす。cc クレートもこの指定に従い C++ を /MT で組む。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
